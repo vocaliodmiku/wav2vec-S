@@ -64,6 +64,7 @@ class HPSNLevel2(nn.Module):
         dropout: float = 0.1,
         causal_lookahead: int = 0,
         inhib_temperature: float = 1.0,
+        inhib_top_k: int = 64,
     ):
         super().__init__()
         self.input_proj = nn.Linear(hidden_dim, lstm_dim)
@@ -75,7 +76,9 @@ class HPSNLevel2(nn.Module):
             dropout=dropout if n_lstm_layers > 1 else 0.0,
             bidirectional=False,
         )
-        self.inhib_gate = LateralInhibitionGate(lstm_dim, vocab_size, temperature=inhib_temperature)
+        self.inhib_gate = LateralInhibitionGate(
+            lstm_dim, vocab_size, temperature=inhib_temperature, top_k=inhib_top_k,
+        )
         self.bu_cross_attn = CrossLayerAttention(
             lstm_dim, n_heads=n_attn_heads, dropout=dropout, lookahead=causal_lookahead
         )
