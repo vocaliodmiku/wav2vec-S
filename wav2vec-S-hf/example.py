@@ -35,7 +35,8 @@ processor = Wav2Vec2Processor.from_pretrained(model_path)
 model = Wav2VecSForCTC.from_pretrained(model_path)
 model.to(torch.bfloat16).cuda()
 model.eval()
-
+model.wav2vec2.encoder.main_context = 8 # [160ms,640ms] m
+model.wav2vec2.encoder.right_context = 2 # [80ms,320ms] r; r <= m/2
 print("model.wav2vec2.encoder.context_type:", model.wav2vec2.encoder.context_type)
 print("model.wav2vec2.encoder.main_context:", model.wav2vec2.encoder.main_context)
 print("model.wav2vec2.encoder.right_context:", model.wav2vec2.encoder.right_context)
