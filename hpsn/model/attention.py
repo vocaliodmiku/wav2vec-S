@@ -1,4 +1,4 @@
-"""Causal cross-layer attention between two HPSN levels."""
+"""Causal cross-layer attention between two HPSN levels (SDPA-backed)."""
 from __future__ import annotations
 
 import torch
@@ -14,14 +14,13 @@ class CrossLayerAttention(nn.Module):
         assert dim % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
-        self.scale = self.head_dim ** -0.5
         self.lookahead = lookahead
+        self.dropout_p = dropout
 
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
         B, T, D = query.shape
@@ -29,15 +28,19 @@ class CrossLayerAttention(nn.Module):
         K = self.k_proj(key_value).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         V = self.v_proj(key_value).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Causal mask: True = disallowed.  diagonal = lookahead + 1 permits `lookahead` frames ahead.
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=query.device, dtype=torch.bool),
-            diagonal=1 + self.lookahead,
-        )
+        dropout_p = self.dropout_p if self.training else 0.0
 
-        attn = (Q @ K.transpose(-2, -1)) * self.scale
-        attn = attn.masked_fill(causal_mask, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-        out = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
+        if self.lookahead == 0:
+            out = F.scaled_dot_product_attention(Q, K, V, is_causal=True, dropout_p=dropout_p)
+        else:
+            # Causal with a right-side lookahead of `self.lookahead` frames.
+            disallow = torch.triu(
+                torch.ones(T, T, device=query.device, dtype=torch.bool),
+                diagonal=1 + self.lookahead,
+            )
+            attn_mask = torch.zeros(T, T, device=query.device, dtype=Q.dtype)
+            attn_mask.masked_fill_(disallow, float("-inf"))
+            out = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, dropout_p=dropout_p)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
         return self.out_proj(out)
