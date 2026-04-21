@@ -23,8 +23,7 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (
     Wav2Vec2PreTrainedModel,
     Wav2Vec2EncoderLayerStableLayerNorm,
     Wav2Vec2EncoderStableLayerNorm,
-    Wav2Vec2Attention,
-    Wav2Vec2FlashAttention2
+    Wav2Vec2Attention
 )
 from transformers import Wav2Vec2Config, Cache, DynamicCache
 from transformers.utils import ModelOutput
@@ -191,12 +190,15 @@ class SinusoidalPositionalEmbedding(nn.Module):
         bspair = torch.onnx.operators.shape_as_tensor(input)
         bsz, seq_len = bspair[0], bspair[1]
         max_pos = self.padding_idx + 1 + seq_len
-        if self.weights is None or max_pos > self.weights.size(0):
-            # recompute/expand embeddings if needed
+        if self.weights is None or max_pos > self.weights.size(0) or self.weights.is_meta:
+            # recompute/expand embeddings if needed (also handles meta tensors from HF init)
             self.weights = SinusoidalPositionalEmbedding.get_embedding(
                 max_pos, self.embedding_dim, self.padding_idx
             )
-        self.weights = self.weights.to(self._float_tensor)
+        if not self._float_tensor.is_meta:
+            self.weights = self.weights.to(
+                device=self._float_tensor.device, dtype=self._float_tensor.dtype
+            )
 
         if incremental_state is not None:
             # positions is the same for every token when decoding a single step
@@ -269,6 +271,9 @@ class Wav2VecSAttention(Wav2Vec2Attention):
         )
 
         self.layer_idx = layer_idx
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(
         self,
@@ -477,8 +482,7 @@ class Wav2VecSSdpaAttention(Wav2VecSAttention):
 
 WAV2VECS_ATTENTION_CLASSES = {
     "eager": Wav2VecSAttention,
-    "sdpa": Wav2VecSSdpaAttention,
-    "flash_attention_2": Wav2Vec2FlashAttention2,
+    "sdpa": Wav2VecSSdpaAttention
 }
 
 class Wav2VecSEncoderLayer(Wav2Vec2EncoderLayer):
@@ -594,7 +598,7 @@ class Wav2VecSEncoder(Wav2Vec2Encoder):
             # make sure padded tokens output 0
             expand_attention_mask = attention_mask.unsqueeze(-1).repeat(1, 1, hidden_states.shape[2])
             hidden_states[~expand_attention_mask] = 0
-            if self._use_flash_attention_2:
+            if self.config._attn_implementation == "flash_attention_2":
                 # 2d mask is passed through the layers
                 attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
             else:
@@ -731,7 +735,7 @@ class Wav2VecSEncoderStableLayerNorm(Wav2Vec2EncoderStableLayerNorm):
             # make sure padded tokens output 0
             expand_attention_mask = attention_mask.unsqueeze(-1).repeat(1, 1, hidden_states.shape[2])
             hidden_states[~expand_attention_mask] = 0
-            if self._use_flash_attention_2:
+            if self.config._attn_implementation == "flash_attention_2":
                 # 2d mask is passed through the layers
                 attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
             else:
