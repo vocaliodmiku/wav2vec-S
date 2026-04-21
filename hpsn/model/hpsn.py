@@ -1,6 +1,8 @@
 """Full 2-level HPSN module wiring the components together."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 
@@ -8,6 +10,11 @@ from ..config import HPSNConfig
 from .backbone import LayerTap
 from .levels import HPSNLevel1, HPSNLevel2
 from .masking import ChunkMasker, FrameMasker
+
+
+@contextmanager
+def _null_region(_name: str):
+    yield
 
 
 class HPSNMinimal(nn.Module):
@@ -35,6 +42,7 @@ class HPSNMinimal(nn.Module):
             dropout=config.dropout,
             causal_lookahead=config.causal_lookahead,
             inhib_temperature=config.inhib_temperature,
+            inhib_top_k=config.inhib_top_k,
         )
         self.level1 = HPSNLevel1(
             hidden_dim=H,
@@ -52,23 +60,30 @@ class HPSNMinimal(nn.Module):
         all_hidden_states: tuple[torch.Tensor, ...],
         attention_mask: torch.Tensor | None = None,
     ) -> dict:
-        acoustic_features = self.tap_acoustic(all_hidden_states)
-        lexical_features = self.tap_lexical(all_hidden_states)
+        prof = getattr(self, "_profiler", None)
+        _region = prof.region if prof is not None else _null_region
 
-        masked_acoustic, mask1 = self.masker_acoustic(acoustic_features)
-        masked_lexical, mask2 = self.masker_lexical(lexical_features)
+        with _region("hpsn.tap"):
+            acoustic_features = self.tap_acoustic(all_hidden_states)
+            lexical_features = self.tap_lexical(all_hidden_states)
+
+        with _region("hpsn.mask"):
+            masked_acoustic, mask1 = self.masker_acoustic(acoustic_features)
+            masked_lexical, mask2 = self.masker_lexical(lexical_features)
 
         # Pass 1: Level 2 without bottom-up error.
-        l2_output, top_down_mu1, recon2 = self.level2(masked_lexical, bu_error=None)
+        with _region("hpsn.level2"):
+            l2_output, top_down_mu1, recon2 = self.level2(masked_lexical, bu_error=None)
 
         # Level 1 uses top-down prediction from Level 2.
-        l1_output, recon1 = self.level1(masked_acoustic, top_down_signal=top_down_mu1)
+        with _region("hpsn.level1"):
+            l1_output, recon1 = self.level1(masked_acoustic, top_down_signal=top_down_mu1)
 
         if self.config.iterative_refine:
-            # Error signal feeds Level 2 on a second pass.
-            error_signal = self.error_proj(l1_output.detach()) - top_down_mu1
-            l2_output, top_down_mu1, recon2 = self.level2(masked_lexical, bu_error=error_signal)
-            l1_output, recon1 = self.level1(masked_acoustic, top_down_signal=top_down_mu1)
+            with _region("hpsn.refine"):
+                error_signal = self.error_proj(l1_output.detach()) - top_down_mu1
+                l2_output, top_down_mu1, recon2 = self.level2(masked_lexical, bu_error=error_signal)
+                l1_output, recon1 = self.level1(masked_acoustic, top_down_signal=top_down_mu1)
 
         # Intersect reconstruction masks with attention_mask (valid frames) if provided.
         if attention_mask is not None:

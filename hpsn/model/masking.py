@@ -6,7 +6,7 @@ import torch.nn as nn
 
 
 class ChunkMasker(nn.Module):
-    """Mask contiguous spans of frames (set to zero)."""
+    """Mask contiguous spans of frames (set to zero). Fully vectorized — no GPU→CPU sync."""
 
     def __init__(self, mask_prob: float = 0.25, min_span: int = 2, max_span: int = 5):
         super().__init__()
@@ -19,18 +19,23 @@ class ChunkMasker(nn.Module):
         if not self.training or self.mask_prob <= 0.0 or T <= self.min_span:
             return x, torch.zeros(B, T, dtype=torch.bool, device=x.device)
 
-        mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)
-        num_to_mask = int(T * self.mask_prob)
-        for b in range(B):
-            masked_so_far = 0
-            guard = 0
-            while masked_so_far < num_to_mask and guard < 4 * num_to_mask:
-                span_len = int(torch.randint(self.min_span, self.max_span + 1, (1,)).item())
-                start = int(torch.randint(0, max(1, T - span_len), (1,)).item())
-                before = mask[b].sum().item()
-                mask[b, start : start + span_len] = True
-                masked_so_far += int(mask[b].sum().item() - before)
-                guard += 1
+        avg_span = (self.min_span + self.max_span) / 2.0
+        # Slight oversample to offset overlap between random spans and hit ~mask_prob coverage.
+        num_spans = max(1, int(round(T * self.mask_prob / avg_span * 1.2)))
+
+        starts = torch.randint(
+            0, max(1, T - self.max_span), (B, num_spans), device=x.device
+        )
+        span_lens = torch.randint(
+            self.min_span, self.max_span + 1, (B, num_spans), device=x.device
+        )
+
+        t_idx = torch.arange(T, device=x.device).view(1, 1, T)
+        starts_e = starts.unsqueeze(-1)
+        ends_e = (starts + span_lens).unsqueeze(-1)
+        span_mask = (t_idx >= starts_e) & (t_idx < ends_e)  # [B, num_spans, T]
+        mask = span_mask.any(dim=1)  # [B, T]
+
         masked_x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return masked_x, mask
 

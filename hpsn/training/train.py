@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import json
 import math
 import os
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import torch
 from accelerate import Accelerator
@@ -18,6 +21,68 @@ from ..model.backbone import FrozenWav2VecS
 from ..model.hpsn import HPSNMinimal
 from .data import build_dataloader
 from .loss import HPSNLoss
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
+def _timestamp() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_autocast_dtype(s: str):
+    s = s.lower()
+    if s in {"fp32", "float32", "none", ""}:
+        return None
+    if s in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if s in {"fp16", "float16", "half"}:
+        return torch.float16
+    raise ValueError(f"hpsn_dtype must be one of fp32/bf16/fp16, got '{s}'")
+
+
+class RegionTimer:
+    """Sync + wall-clock timing grouped by region. Safe for CUDA; sync per region."""
+
+    def __init__(self, enabled: bool, device: torch.device):
+        self.enabled = enabled
+        self.device = device
+        self.is_cuda = enabled and device.type == "cuda"
+        self.totals: "OrderedDict[str, float]" = OrderedDict()
+        self.counts: "OrderedDict[str, int]" = OrderedDict()
+
+    @contextmanager
+    def region(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        if self.is_cuda:
+            torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.is_cuda:
+                torch.cuda.synchronize(self.device)
+            dt = time.perf_counter() - t0
+            self.totals[name] = self.totals.get(name, 0.0) + dt
+            self.counts[name] = self.counts.get(name, 0) + 1
+
+    def report(self, n_steps: int) -> str:
+        if not self.totals:
+            return "(no profile data)"
+        total = sum(self.totals.values())
+        lines = [
+            f"=== profile over {n_steps} optimizer steps ({total:.2f}s cumulative instrumented time) ===",
+            f"{'region':<24} {'total_s':>10} {'per_call_ms':>14} {'calls':>8} {'%':>7}",
+        ]
+        for name, tot in sorted(self.totals.items(), key=lambda kv: -kv[1]):
+            calls = self.counts[name]
+            lines.append(
+                f"{name:<24} {tot:>10.3f} {1000*tot/calls:>14.2f} {calls:>8d} {100*tot/total:>6.1f}%"
+            )
+        return "\n".join(lines)
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -61,7 +126,7 @@ def main():
     if config.hidden_dim != backbone.hidden_size:
         if accelerator.is_main_process:
             accelerator.print(
-                f"[info] hidden_dim {config.hidden_dim} != backbone {backbone.hidden_size}; using backbone size."
+                f"[{_timestamp()}] [info] hidden_dim {config.hidden_dim} != backbone {backbone.hidden_size}; using backbone size."
             )
         config.hidden_dim = backbone.hidden_size
 
@@ -104,10 +169,41 @@ def main():
         model, optimizer, dataloader, scheduler
     )
 
+    if config.compile_hpsn:
+        import sys
+        if sys.version_info >= (3, 13):
+            if accelerator.is_main_process:
+                accelerator.print(
+                    f"[{_timestamp()}] [warn] torch.compile disabled: TorchDynamo is not supported on Python {sys.version_info.major}.{sys.version_info.minor}. "
+                    "Use Python 3.11 or 3.12 to enable."
+                )
+        else:
+            raw = accelerator.unwrap_model(model)
+            raw.level1 = torch.compile(raw.level1, mode=config.compile_mode, dynamic=True)
+            raw.level2 = torch.compile(raw.level2, mode=config.compile_mode, dynamic=True)
+            if accelerator.is_main_process:
+                accelerator.print(
+                    f"[{_timestamp()}] [info] torch.compile enabled on HPSN level1/level2 (mode={config.compile_mode}, dynamic=True)."
+                )
+
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        accelerator.print(f"[info] HPSN trainable parameters: {n_params/1e6:.2f}M")
-        accelerator.print(f"[info] dataset size: {len(dataloader.dataset)} utterances")
+        accelerator.print(f"[{_timestamp()}] [info] HPSN trainable parameters: {n_params/1e6:.2f}M")
+        accelerator.print(f"[{_timestamp()}] [info] dataset size: {len(dataloader.dataset)} utterances")
+        if config.profile:
+            accelerator.print(
+                f"[{_timestamp()}] [info] profile mode ON — will stop after {config.profile_steps} optimizer steps."
+            )
+
+    profiler = RegionTimer(enabled=config.profile, device=accelerator.device)
+    # Expose profiler to HPSN submodules for inner timings.
+    accelerator.unwrap_model(model)._profiler = profiler if config.profile else None
+
+    hpsn_compute_dtype = _parse_autocast_dtype(config.hpsn_dtype)
+    if hpsn_compute_dtype is not None and accelerator.is_main_process:
+        accelerator.print(
+            f"[{_timestamp()}] [info] HPSN head autocast dtype: {hpsn_compute_dtype} (params remain fp32, loss in fp32)."
+        )
 
     model.train()
     step = 0
@@ -115,28 +211,47 @@ def main():
     running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "count": 0}
     done = False
 
+    data_iter_t0 = time.perf_counter() if config.profile else None
+
     while not done:
         for batch in dataloader:
+            if config.profile:
+                # Time spent waiting for the dataloader since the last micro-batch finished.
+                dt_data = time.perf_counter() - data_iter_t0
+                profiler.totals["data_wait"] = profiler.totals.get("data_wait", 0.0) + dt_data
+                profiler.counts["data_wait"] = profiler.counts.get("data_wait", 0) + 1
+
             with accelerator.accumulate(model):
                 input_values = batch["input_values"]
                 attention_mask = batch["attention_mask"]
 
-                with torch.no_grad():
-                    with accelerator.autocast():
-                        hidden_states = backbone(input_values, attention_mask=attention_mask)
-                # Cast to fp32 for HPSN training.
-                hidden_states = tuple(h.float() for h in hidden_states)
+                with profiler.region("backbone"):
+                    with torch.no_grad():
+                        with accelerator.autocast():
+                            hidden_states = backbone(input_values, attention_mask=attention_mask)
+                    # Keep backbone states in bf16; LayerTap casts only the tapped bands to fp32.
 
-                outputs = model(hidden_states, attention_mask=attention_mask)
-                losses = loss_fn(outputs)
-                loss = losses["total"]
+                with profiler.region("hpsn.forward"):
+                    if hpsn_compute_dtype is not None:
+                        with torch.autocast(
+                            device_type=accelerator.device.type, dtype=hpsn_compute_dtype
+                        ):
+                            outputs = model(hidden_states, attention_mask=attention_mask)
+                    else:
+                        outputs = model(hidden_states, attention_mask=attention_mask)
+                with profiler.region("loss"):
+                    # Loss runs outside autocast; _recon_loss casts to fp32 internally.
+                    losses = loss_fn(outputs)
+                    loss = losses["total"]
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), config.grad_clip)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                with profiler.region("backward"):
+                    accelerator.backward(loss)
+                with profiler.region("optim"):
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
             # Accumulate for logging.
             running["total"] += loss.detach().float().item()
@@ -152,28 +267,38 @@ def main():
                     dt = time.time() - last_log_time
                     lr = scheduler.get_last_lr()[0]
                     accelerator.print(
-                        f"step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
+                        f"[{_timestamp()}] step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
                         f"| recon1 {running['recon1']/n:.4f} | recon2 {running['recon2']/n:.4f} "
                         f"| {n/max(dt,1e-6):.2f} it/s"
                     )
                     running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "count": 0}
                     last_log_time = time.time()
 
+                if config.profile and step >= config.profile_steps:
+                    if accelerator.is_main_process:
+                        accelerator.print(profiler.report(step))
+                    done = True
+                    break
+
                 if step % config.save_steps == 0:
                     ckpt_dir = os.path.join(config.output_dir, f"checkpoint-{step}")
                     accelerator.save_state(ckpt_dir)
                     if accelerator.is_main_process:
-                        accelerator.print(f"[info] saved checkpoint to {ckpt_dir}")
+                        accelerator.print(f"[{_timestamp()}] [info] saved checkpoint to {ckpt_dir}")
 
                 if step >= config.max_steps:
                     done = True
                     break
 
-    # Final save.
-    final_dir = os.path.join(config.output_dir, "final")
-    accelerator.save_state(final_dir)
-    if accelerator.is_main_process:
-        accelerator.print(f"[info] training complete. final checkpoint: {final_dir}")
+            if config.profile:
+                data_iter_t0 = time.perf_counter()
+
+    # Final save (skipped in profile mode — nothing trained).
+    if not config.profile:
+        final_dir = os.path.join(config.output_dir, "final")
+        accelerator.save_state(final_dir)
+        if accelerator.is_main_process:
+            accelerator.print(f"[{_timestamp()}] [info] training complete. final checkpoint: {final_dir}")
 
 
 if __name__ == "__main__":

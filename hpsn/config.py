@@ -37,6 +37,7 @@ class HPSNConfig:
 
     # Inhibition
     inhib_temperature: float = 1.0
+    inhib_top_k: int = 64
 
     # Loss
     lambda1: float = 1.0
@@ -64,3 +65,18 @@ class HPSNConfig:
     logging_steps: int = 50
     save_steps: int = 5000
     seed: int = 42
+
+    # Profiling (when True, measure per-region time and stop after `profile_steps`
+    # optimizer steps).
+    profile: bool = False
+    profile_steps: int = 20
+
+    # HPSN head compute precision. Parameters stay fp32 (for the optimizer);
+    # forward/backward run in this dtype via torch.autocast. Loss is kept in fp32.
+    # Options: 'fp32', 'bf16', 'fp16'.
+    hpsn_dtype: str = "fp32"
+
+    # torch.compile for HPSN level1/level2 submodules. Top-level stays eager
+    # so profiler regions and tap/mask python logic are preserved.
+    compile_hpsn: bool = True
+    compile_mode: str = "default"   # 'default' | 'reduce-overhead' | 'max-autotune'

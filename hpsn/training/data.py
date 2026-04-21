@@ -95,4 +95,6 @@ def build_dataloader(
         collate_fn=Collator(feature_extractor),
         pin_memory=True,
         drop_last=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
