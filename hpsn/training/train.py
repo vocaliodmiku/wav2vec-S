@@ -169,23 +169,6 @@ def main():
         model, optimizer, dataloader, scheduler
     )
 
-    if config.compile_hpsn:
-        import sys
-        if sys.version_info >= (3, 13):
-            if accelerator.is_main_process:
-                accelerator.print(
-                    f"[{_timestamp()}] [warn] torch.compile disabled: TorchDynamo is not supported on Python {sys.version_info.major}.{sys.version_info.minor}. "
-                    "Use Python 3.11 or 3.12 to enable."
-                )
-        else:
-            raw = accelerator.unwrap_model(model)
-            raw.level1 = torch.compile(raw.level1, mode=config.compile_mode, dynamic=True)
-            raw.level2 = torch.compile(raw.level2, mode=config.compile_mode, dynamic=True)
-            if accelerator.is_main_process:
-                accelerator.print(
-                    f"[{_timestamp()}] [info] torch.compile enabled on HPSN level1/level2 (mode={config.compile_mode}, dynamic=True)."
-                )
-
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         accelerator.print(f"[{_timestamp()}] [info] HPSN trainable parameters: {n_params/1e6:.2f}M")

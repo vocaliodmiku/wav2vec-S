@@ -75,8 +75,3 @@ class HPSNConfig:
     # forward/backward run in this dtype via torch.autocast. Loss is kept in fp32.
     # Options: 'fp32', 'bf16', 'fp16'.
     hpsn_dtype: str = "fp32"
-
-    # torch.compile for HPSN level1/level2 submodules. Top-level stays eager
-    # so profiler regions and tap/mask python logic are preserved.
-    compile_hpsn: bool = True
-    compile_mode: str = "default"   # 'default' | 'reduce-overhead' | 'max-autotune'
