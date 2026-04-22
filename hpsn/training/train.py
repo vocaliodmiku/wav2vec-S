@@ -110,7 +110,6 @@ def main():
         with open(os.path.join(config.output_dir, "config.json"), "w") as f:
             json.dump(dataclasses.asdict(config), f, indent=2)
 
-    # Feature extractor (processor.tokenizer isn't needed here).
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.backbone_model)
 
     # Frozen backbone (bf16 weights, no grad).
@@ -130,16 +129,45 @@ def main():
             )
         config.hidden_dim = backbone.hidden_size
 
-    # Validate tap ranges against backbone depth (hidden_states length = N + 1).
+    # Adapt tap ranges to backbone depth. Defaults target wav2vec-S-Large
+    # (24 transformer layers); for shallower backbones (e.g. Base, 12 layers)
+    # we rescale the four indices proportionally so the acoustic / lexical
+    # bands land at the same *fractional* depth as on Large.
     max_layer_idx = backbone.num_hidden_layers
-    for name, end in [
-        ("acoustic", config.tap_acoustic_end),
-        ("lexical", config.tap_lexical_end),
-    ]:
-        if end > max_layer_idx:
-            raise ValueError(f"tap_{name}_end={end} exceeds backbone layers={max_layer_idx}")
+    _REFERENCE_LAYERS = 24
+    if config.tap_lexical_end > max_layer_idx:
+        scale = max_layer_idx / _REFERENCE_LAYERS
+        old = (
+            config.tap_acoustic_start, config.tap_acoustic_end,
+            config.tap_lexical_start, config.tap_lexical_end,
+        )
+        a_start = max(1, round(config.tap_acoustic_start * scale))
+        a_end = max(a_start, round(config.tap_acoustic_end * scale))
+        l_start = max(a_end + 1, round(config.tap_lexical_start * scale))
+        l_end = min(max_layer_idx, max(l_start, round(config.tap_lexical_end * scale)))
+        if l_start > max_layer_idx:
+            raise ValueError(
+                f"cannot fit tap ranges into backbone depth {max_layer_idx} "
+                f"(acoustic ends at {a_end}, no room for lexical band)"
+            )
+        config.tap_acoustic_start = a_start
+        config.tap_acoustic_end = a_end
+        config.tap_lexical_start = l_start
+        config.tap_lexical_end = l_end
+        if accelerator.is_main_process:
+            accelerator.print(
+                f"[{_timestamp()}] [info] rescaled tap ranges for backbone depth "
+                f"{max_layer_idx}: acoustic {old[0]}-{old[1]} → {a_start}-{a_end}, "
+                f"lexical {old[2]}-{old[3]} → {l_start}-{l_end}."
+            )
+    elif config.tap_acoustic_end >= config.tap_lexical_start:
+        raise ValueError(
+            f"tap_acoustic_end={config.tap_acoustic_end} must be < "
+            f"tap_lexical_start={config.tap_lexical_start}"
+        )
 
     model = HPSNMinimal(config)
+
     loss_fn = HPSNLoss(config.lambda1, config.lambda2, config.loss_type)
 
     optimizer = torch.optim.AdamW(
