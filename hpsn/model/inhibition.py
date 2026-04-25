@@ -44,6 +44,8 @@ class LateralInhibitionGate(nn.Module):
 
         activations = F.relu(sims)                                 # keep only positive evidence
         topk_vals, topk_idx = activations.topk(K, dim=-1)          # [B, T, K]
+        # Side-channel for monitoring codebook utilization (no grad).
+        self.last_topk_idx = topk_idx.detach()
 
         # Pairwise similarity among the K winners' prototypes (cohort competition).
         protos = self.codebook.weight[topk_idx]                    # [B, T, K, D]

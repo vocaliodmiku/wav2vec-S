@@ -153,7 +153,22 @@ def _compute_monitors(unwrapped_model: HPSN, outputs: dict) -> dict:
     tap1_w = F.softmax(unwrapped_model.tap1.weights, dim=0).cpu().tolist()
     tap2_w = F.softmax(unwrapped_model.tap2.weights, dim=0).cpu().tolist()
     tap3_w = F.softmax(unwrapped_model.tap3.weights, dim=0).cpu().tolist()
-    alpha = float(unwrapped_model.level2.inhib_gate.alpha)
+
+    # Inhibition gates: L1 (phoneme cohort) and L2 (lexical cohort).
+    cb1 = unwrapped_model.level1.inhib_gate
+    cb2 = unwrapped_model.level2.inhib_gate
+    alpha1 = float(cb1.alpha)
+    alpha2 = float(cb2.alpha)
+
+    # Codebook utilization on the most recent batch — number of distinct prototypes
+    # selected by the top-k cohort. If only a handful are ever used, cohort
+    # competition has collapsed.
+    n_codes_total_1 = cb1.codebook.num_embeddings
+    n_codes_total_2 = cb2.codebook.num_embeddings
+    last_idx_1 = getattr(cb1, "last_topk_idx", None)
+    last_idx_2 = getattr(cb2, "last_topk_idx", None)
+    n_codes_used_1 = int(last_idx_1.unique().numel()) if last_idx_1 is not None else 0
+    n_codes_used_2 = int(last_idx_2.unique().numel()) if last_idx_2 is not None else 0
 
     recon_cos: dict[int, float] = {}
     for i in (1, 2, 3):
@@ -165,12 +180,27 @@ def _compute_monitors(unwrapped_model: HPSN, outputs: dict) -> dict:
         t = outputs[f"target{i}"][mask].float()
         recon_cos[i] = F.cosine_similarity(r, t, dim=-1).mean().item()
 
+    # Top-down prediction cosine: does the higher level's prediction μ_i point
+    # in the same direction as the lower level's representation? Near zero ⇒
+    # cross-attention pathway is being ignored (top-down doing no real work).
+    td_cos: dict[int, float] = {}
+    for i, repr_key in ((1, "level1_repr"), (2, "level2_repr")):
+        mu = outputs[f"mu{i}"].float()
+        rep = outputs[repr_key].float()
+        td_cos[i] = F.cosine_similarity(mu, rep, dim=-1).mean().item()
+
     return {
         "tap1_w": tap1_w,
         "tap2_w": tap2_w,
         "tap3_w": tap3_w,
-        "inhibition_alpha": alpha,
+        "alpha1": alpha1,
+        "alpha2": alpha2,
+        "n_codes_used_1": n_codes_used_1,
+        "n_codes_total_1": n_codes_total_1,
+        "n_codes_used_2": n_codes_used_2,
+        "n_codes_total_2": n_codes_total_2,
         "recon_cos": recon_cos,
+        "td_cos": td_cos,
     }
 
 
@@ -217,7 +247,13 @@ def main():
 
     model = HPSN(config)
 
-    loss_fn = HPSNLoss(config.lambda1, config.lambda2, config.lambda3, config.loss_type)
+    loss_fn = HPSNLoss(
+        config.lambda1,
+        config.lambda2,
+        config.lambda3,
+        config.lambda_td,
+        config.loss_type,
+    )
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -268,7 +304,13 @@ def main():
     model.train()
     step = 0
     last_log_time = time.time()
-    running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "recon3": 0.0, "count": 0}
+    running = {
+        "total": 0.0,
+        "recon1": 0.0, "recon2": 0.0, "recon3": 0.0,
+        "td_2to1": 0.0, "td_3to2": 0.0,
+        "count": 0,
+    }
+    last_grad_norm = float("nan")  # pre-clip global grad norm of the most recent optimizer step
     done = False
 
     data_iter_t0 = time.perf_counter() if config.profile else None
@@ -308,7 +350,9 @@ def main():
                     accelerator.backward(loss)
                 with profiler.region("optim"):
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), config.grad_clip)
+                        gn = accelerator.clip_grad_norm_(model.parameters(), config.grad_clip)
+                        # gn is a tensor under accelerate; cast safely to float for logging.
+                        last_grad_norm = float(gn) if gn is not None else float("nan")
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -318,6 +362,8 @@ def main():
             running["recon1"] += losses["recon1"].float().item()
             running["recon2"] += losses["recon2"].float().item()
             running["recon3"] += losses["recon3"].float().item()
+            running["td_2to1"] += losses["td_2to1"].float().item()
+            running["td_3to2"] += losses["td_3to2"].float().item()
             running["count"] += 1
 
             if accelerator.sync_gradients:
@@ -329,19 +375,30 @@ def main():
                     lr = scheduler.get_last_lr()[0]
                     mon = _compute_monitors(accelerator.unwrap_model(model), outputs)
                     rc = mon["recon_cos"]
+                    tdc = mon["td_cos"]
                     accelerator.print(
                         f"[{_timestamp()}] step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
                         f"| recon1/2/3 {running['recon1']/n:.4f}/{running['recon2']/n:.4f}/{running['recon3']/n:.4f} "
-                        f"| {n/max(dt,1e-6):.2f} it/s"
+                        f"| td2to1/3to2 {running['td_2to1']/n:.3f}/{running['td_3to2']/n:.3f} "
+                        f"| gnorm {last_grad_norm:.2f} | {n/max(dt,1e-6):.2f} it/s"
                     )
                     accelerator.print(
-                        f"[{_timestamp()}]         | alpha {mon['inhibition_alpha']:+.3f} "
+                        f"[{_timestamp()}]         "
+                        f"| alpha1/2 {mon['alpha1']:+.3f}/{mon['alpha2']:+.3f} "
+                        f"| codes1 {mon['n_codes_used_1']:>3d}/{mon['n_codes_total_1']} "
+                        f"codes2 {mon['n_codes_used_2']:>3d}/{mon['n_codes_total_2']} "
                         f"| rcos1/2/3 {rc[1]:+.3f}/{rc[2]:+.3f}/{rc[3]:+.3f} "
+                        f"| tdcos1/2 {tdc[1]:+.3f}/{tdc[2]:+.3f} "
                         f"| tap1 {_format_tap_weights(mon['tap1_w'])} "
                         f"tap2 {_format_tap_weights(mon['tap2_w'])} "
                         f"tap3 {_format_tap_weights(mon['tap3_w'])}"
                     )
-                    running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "recon3": 0.0, "count": 0}
+                    running = {
+                        "total": 0.0,
+                        "recon1": 0.0, "recon2": 0.0, "recon3": 0.0,
+                        "td_2to1": 0.0, "td_3to2": 0.0,
+                        "count": 0,
+                    }
                     last_log_time = time.time()
 
                 if config.profile and step >= config.profile_steps:

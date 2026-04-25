@@ -32,16 +32,22 @@ class HPSNConfig:
     main_context: int = 8
     right_context: int = 2
 
-    # Inhibition (L2 only) — codebook-style cohort competition
-    inhib_num_codes: int = 320      # learned prototype vectors (~wav2vec2 codebook size)
-    inhib_temperature: float = 1.0
+    # Inhibition — codebook-style cohort competition.
+    # L2 (lexical/sublexical): ~wav2vec2 codebook size.
+    inhib_num_codes: int = 320
     inhib_top_k: int = 64
+    # L1 (phoneme-level): smaller codebook, narrower cohort — categorical perception.
+    inhib_l1_num_codes: int = 50
+    inhib_l1_top_k: int = 8
+    # Shared temperature for cohort softmax (both levels).
+    inhib_temperature: float = 1.0
 
     # Loss
     lambda1: float = 1.0
     lambda2: float = 1.0
     lambda3: float = 1.0
-    loss_type: str = "l1"           # 'l1', 'mse', 'cosine'
+    lambda_td: float = 0.2          # weight on top-down prediction alignment loss
+    loss_type: str = "l1"           # 'l1', 'mse', 'cosine'  (recon term only)
 
     # Training
     learning_rate: float = 5e-4

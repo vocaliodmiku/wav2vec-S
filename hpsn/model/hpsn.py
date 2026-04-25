@@ -68,9 +68,12 @@ class HPSN(nn.Module):
             hidden_dim=H,
             lstm_dim=D,
             n_lstm_layers=config.n_lstm_layers,
+            num_codes=config.inhib_l1_num_codes,
             n_attn_heads=config.n_attn_heads,
             dropout=config.dropout,
             causal_lookahead=config.causal_lookahead,
+            inhib_temperature=config.inhib_temperature,
+            inhib_top_k=config.inhib_l1_top_k,
         )
 
     def forward(
@@ -108,6 +111,8 @@ class HPSN(nn.Module):
             mask1 = mask1 & valid
             mask2 = mask2 & valid
             mask3 = mask3 & valid
+        else:
+            valid = None
 
         return {
             "recon1": recon1,
@@ -122,6 +127,13 @@ class HPSN(nn.Module):
             "level1_repr": l1_repr,
             "level2_repr": l2_repr,
             "level3_repr": l3_repr,
+            # Top-down predictions (D-space) — supervised against level_repr
+            # via the L_td term, and used as cross-attn K/V for the lower level.
+            "mu1": mu1,
+            "mu2": mu2,
+            # Frame-resolution valid mask (downsampled attention_mask), used by
+            # L_td to skip padding positions. None if no attention_mask was given.
+            "valid_mask": valid,
         }
 
 

@@ -66,16 +66,21 @@ class TransformerBlock(nn.Module):
 
 class HPSNLevel1(nn.Module):
     """Phonemic level. Stack of Transformer blocks with causal self-attention
-    and causal cross-attention to Level 2's top-down signal μ₁."""
+    and causal cross-attention to Level 2's top-down signal μ₁. A small
+    codebook-style inhibition gate runs after the blocks to model
+    phoneme-level cohort competition (categorical perception)."""
 
     def __init__(
         self,
         hidden_dim: int = 768,
         lstm_dim: int = 512,
         n_lstm_layers: int = 2,
+        num_codes: int = 50,
         n_attn_heads: int = 8,
         dropout: float = 0.1,
         causal_lookahead: int = 0,
+        inhib_temperature: float = 1.0,
+        inhib_top_k: int = 8,
     ):
         super().__init__()
         level_dim, n_blocks = lstm_dim, n_lstm_layers
@@ -86,6 +91,9 @@ class HPSNLevel1(nn.Module):
                 for _ in range(n_blocks)
             ]
         )
+        self.inhib_gate = LateralInhibitionGate(
+            level_dim, num_codes, temperature=inhib_temperature, top_k=inhib_top_k,
+        )
         self.recon_head = nn.Linear(level_dim, hidden_dim)
 
     def forward(
@@ -94,6 +102,7 @@ class HPSNLevel1(nn.Module):
         x = self.input_proj(masked_input)
         for block in self.blocks:
             x = block(x, cross_kv=cross_kv)
+        x = self.inhib_gate(x)
         recon = self.recon_head(x)
         return x, recon
 
