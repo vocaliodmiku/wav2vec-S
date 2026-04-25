@@ -1,1 +1,1 @@
-"""HPSN: Hierarchical Predictive Speech Network (minimal 2-level)."""
+"""HPSN: Hierarchical Predictive Speech Network (3-level full model)."""

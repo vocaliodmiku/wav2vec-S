@@ -12,13 +12,14 @@ from collections import OrderedDict
 from contextlib import contextmanager
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from transformers import Wav2Vec2FeatureExtractor, get_cosine_schedule_with_warmup
 
 from ..config import HPSNConfig
 from ..model.backbone import FrozenWav2VecS
-from ..model.hpsn import HPSNMinimal
+from ..model.hpsn import HPSN
 from .data import build_dataloader
 from .loss import HPSNLoss
 
@@ -40,6 +41,18 @@ def _parse_autocast_dtype(s: str):
     if s in {"fp16", "float16", "half"}:
         return torch.float16
     raise ValueError(f"hpsn_dtype must be one of fp32/bf16/fp16, got '{s}'")
+
+
+def _parse_tuple_int(s: str) -> tuple[int, ...]:
+    """Parse '1,2,3,4' or '1 2 3 4' into a tuple of ints."""
+    parts = s.replace(",", " ").split()
+    if not parts:
+        raise argparse.ArgumentTypeError("tap layer list cannot be empty")
+    return tuple(int(p) for p in parts)
+
+
+def _format_tap_weights(w: list[float]) -> str:
+    return "[" + ",".join(f"{x:.2f}" for x in w) + "]"
 
 
 class RegionTimer:
@@ -89,12 +102,76 @@ def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     defaults = HPSNConfig()
     for f in dataclasses.fields(HPSNConfig):
-        t = f.type if not isinstance(f.type, str) else type(getattr(defaults, f.name))
-        if t is bool:
-            p.add_argument(f"--{f.name}", type=lambda s: s.lower() in {"1", "true", "yes"}, default=getattr(defaults, f.name))
+        default = getattr(defaults, f.name)
+        if isinstance(default, tuple):
+            p.add_argument(f"--{f.name}", type=_parse_tuple_int, default=default)
+        elif isinstance(default, bool):
+            p.add_argument(
+                f"--{f.name}",
+                type=lambda s: s.lower() in {"1", "true", "yes"},
+                default=default,
+            )
         else:
-            p.add_argument(f"--{f.name}", type=t, default=getattr(defaults, f.name))
+            t = f.type if not isinstance(f.type, str) else type(default)
+            p.add_argument(f"--{f.name}", type=t, default=default)
     return p
+
+
+def _validate_tap_layers(config: HPSNConfig, max_layer_idx: int) -> None:
+    """Each tap index must be in [1, max_layer_idx]; bands must be disjoint."""
+    bands = [
+        ("level1", config.level1_tap_layers),
+        ("level2", config.level2_tap_layers),
+        ("level3", config.level3_tap_layers),
+    ]
+    seen: dict[int, str] = {}
+    for name, taps in bands:
+        if len(taps) == 0:
+            raise ValueError(f"{name}_tap_layers is empty")
+        for idx in taps:
+            if not (1 <= idx <= max_layer_idx):
+                raise ValueError(
+                    f"{name}_tap_layers contains index {idx} outside "
+                    f"[1, {max_layer_idx}] for backbone {config.backbone_model}"
+                )
+            if idx in seen:
+                raise ValueError(
+                    f"{name}_tap_layers index {idx} overlaps with {seen[idx]}_tap_layers"
+                )
+            seen[idx] = name
+
+
+@torch.no_grad()
+def _compute_monitors(unwrapped_model: HPSN, outputs: dict) -> dict:
+    """Per-log-window monitors computed from the most recent batch.
+
+    Returns a dict containing:
+      tap1_w, tap2_w, tap3_w  — list[float], softmax-normalized tap weights
+      inhibition_alpha        — float, learned inhibition scale at L2
+      recon_cos               — dict[int, float], cos(recon_i, target_i) on masked positions
+    """
+    tap1_w = F.softmax(unwrapped_model.tap1.weights, dim=0).cpu().tolist()
+    tap2_w = F.softmax(unwrapped_model.tap2.weights, dim=0).cpu().tolist()
+    tap3_w = F.softmax(unwrapped_model.tap3.weights, dim=0).cpu().tolist()
+    alpha = float(unwrapped_model.level2.inhib_gate.alpha)
+
+    recon_cos: dict[int, float] = {}
+    for i in (1, 2, 3):
+        mask = outputs[f"mask{i}"]
+        if mask.sum() == 0:
+            recon_cos[i] = float("nan")
+            continue
+        r = outputs[f"recon{i}"][mask].float()
+        t = outputs[f"target{i}"][mask].float()
+        recon_cos[i] = F.cosine_similarity(r, t, dim=-1).mean().item()
+
+    return {
+        "tap1_w": tap1_w,
+        "tap2_w": tap2_w,
+        "tap3_w": tap3_w,
+        "inhibition_alpha": alpha,
+        "recon_cos": recon_cos,
+    }
 
 
 def main():
@@ -125,50 +202,22 @@ def main():
     if config.hidden_dim != backbone.hidden_size:
         if accelerator.is_main_process:
             accelerator.print(
-                f"[{_timestamp()}] [info] hidden_dim {config.hidden_dim} != backbone {backbone.hidden_size}; using backbone size."
+                f"[{_timestamp()}] [info] hidden_dim {config.hidden_dim} != backbone "
+                f"{backbone.hidden_size}; using backbone size."
             )
         config.hidden_dim = backbone.hidden_size
 
-    # Adapt tap ranges to backbone depth. Defaults target wav2vec-S-Large
-    # (24 transformer layers); for shallower backbones (e.g. Base, 12 layers)
-    # we rescale the four indices proportionally so the acoustic / lexical
-    # bands land at the same *fractional* depth as on Large.
-    max_layer_idx = backbone.num_hidden_layers
-    _REFERENCE_LAYERS = 24
-    if config.tap_lexical_end > max_layer_idx:
-        scale = max_layer_idx / _REFERENCE_LAYERS
-        old = (
-            config.tap_acoustic_start, config.tap_acoustic_end,
-            config.tap_lexical_start, config.tap_lexical_end,
-        )
-        a_start = max(1, round(config.tap_acoustic_start * scale))
-        a_end = max(a_start, round(config.tap_acoustic_end * scale))
-        l_start = max(a_end + 1, round(config.tap_lexical_start * scale))
-        l_end = min(max_layer_idx, max(l_start, round(config.tap_lexical_end * scale)))
-        if l_start > max_layer_idx:
-            raise ValueError(
-                f"cannot fit tap ranges into backbone depth {max_layer_idx} "
-                f"(acoustic ends at {a_end}, no room for lexical band)"
-            )
-        config.tap_acoustic_start = a_start
-        config.tap_acoustic_end = a_end
-        config.tap_lexical_start = l_start
-        config.tap_lexical_end = l_end
-        if accelerator.is_main_process:
-            accelerator.print(
-                f"[{_timestamp()}] [info] rescaled tap ranges for backbone depth "
-                f"{max_layer_idx}: acoustic {old[0]}-{old[1]} → {a_start}-{a_end}, "
-                f"lexical {old[2]}-{old[3]} → {l_start}-{l_end}."
-            )
-    elif config.tap_acoustic_end >= config.tap_lexical_start:
-        raise ValueError(
-            f"tap_acoustic_end={config.tap_acoustic_end} must be < "
-            f"tap_lexical_start={config.tap_lexical_start}"
+    _validate_tap_layers(config, backbone.num_hidden_layers)
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[{_timestamp()}] [info] tap bands "
+            f"L1={config.level1_tap_layers} L2={config.level2_tap_layers} "
+            f"L3={config.level3_tap_layers} (backbone depth {backbone.num_hidden_layers})"
         )
 
-    model = HPSNMinimal(config)
+    model = HPSN(config)
 
-    loss_fn = HPSNLoss(config.lambda1, config.lambda2, config.loss_type)
+    loss_fn = HPSNLoss(config.lambda1, config.lambda2, config.lambda3, config.loss_type)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -219,7 +268,7 @@ def main():
     model.train()
     step = 0
     last_log_time = time.time()
-    running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "count": 0}
+    running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "recon3": 0.0, "count": 0}
     done = False
 
     data_iter_t0 = time.perf_counter() if config.profile else None
@@ -268,6 +317,7 @@ def main():
             running["total"] += loss.detach().float().item()
             running["recon1"] += losses["recon1"].float().item()
             running["recon2"] += losses["recon2"].float().item()
+            running["recon3"] += losses["recon3"].float().item()
             running["count"] += 1
 
             if accelerator.sync_gradients:
@@ -277,12 +327,21 @@ def main():
                     n = max(running["count"], 1)
                     dt = time.time() - last_log_time
                     lr = scheduler.get_last_lr()[0]
+                    mon = _compute_monitors(accelerator.unwrap_model(model), outputs)
+                    rc = mon["recon_cos"]
                     accelerator.print(
                         f"[{_timestamp()}] step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
-                        f"| recon1 {running['recon1']/n:.4f} | recon2 {running['recon2']/n:.4f} "
+                        f"| recon1/2/3 {running['recon1']/n:.4f}/{running['recon2']/n:.4f}/{running['recon3']/n:.4f} "
                         f"| {n/max(dt,1e-6):.2f} it/s"
                     )
-                    running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "count": 0}
+                    accelerator.print(
+                        f"[{_timestamp()}]         | alpha {mon['inhibition_alpha']:+.3f} "
+                        f"| rcos1/2/3 {rc[1]:+.3f}/{rc[2]:+.3f}/{rc[3]:+.3f} "
+                        f"| tap1 {_format_tap_weights(mon['tap1_w'])} "
+                        f"tap2 {_format_tap_weights(mon['tap2_w'])} "
+                        f"tap3 {_format_tap_weights(mon['tap3_w'])}"
+                    )
+                    running = {"total": 0.0, "recon1": 0.0, "recon2": 0.0, "recon3": 0.0, "count": 0}
                     last_log_time = time.time()
 
                 if config.profile and step >= config.profile_steps:

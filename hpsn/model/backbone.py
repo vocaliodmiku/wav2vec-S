@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -62,19 +62,18 @@ class FrozenWav2VecS(nn.Module):
 
 
 class LayerTap(nn.Module):
-    """ELMo-style learnable scalar mix over an inclusive layer-index range."""
+    """ELMo-style learnable scalar mix over an arbitrary list of layer indices."""
 
-    def __init__(self, layer_start: int, layer_end: int):
+    def __init__(self, layers: Sequence[int]):
         super().__init__()
-        assert layer_end >= layer_start
-        self.layer_start = layer_start
-        self.layer_end = layer_end
-        n_layers = layer_end - layer_start + 1
-        self.weights = nn.Parameter(torch.zeros(n_layers))  # softmax → uniform at init
+        layers = tuple(layers)
+        assert len(layers) > 0, "LayerTap needs at least one layer index"
+        self.layers = layers
+        self.weights = nn.Parameter(torch.zeros(len(layers)))  # softmax → uniform at init
 
     def forward(self, all_hidden_states: List[torch.Tensor]) -> torch.Tensor:
         selected = torch.stack(
-            [all_hidden_states[i].float() for i in range(self.layer_start, self.layer_end + 1)],
+            [all_hidden_states[i].float() for i in self.layers],
             dim=0,
         )  # [n_layers, B, T, D]
         w = F.softmax(self.weights, dim=0).view(-1, 1, 1, 1)

@@ -1,47 +1,46 @@
-"""HPSN configuration dataclass."""
-from dataclasses import dataclass
+"""HPSN configuration dataclass (full 3-level model)."""
+from dataclasses import dataclass, field
+from typing import Tuple
 
 
 @dataclass
 class HPSNConfig:
     # Backbone / architecture
-    backbone_model: str = "biaofu-xmu/wav2vec-S-Large-ft-960h"
-    hidden_dim: int = 1024          # wav2vec-S-Large hidden size
-    lstm_dim: int = 512
-    n_lstm_layers: int = 2
-    vocab_size: int = 32000         # for inhibition gate (not the CTC vocab)
+    backbone_model: str = "biaofu-xmu/wav2vec-S-Base-ft-960h"
+    hidden_dim: int = 768           # wav2vec-S-Base hidden size
+    lstm_dim: int = 512             # internal level dim D (shared by L1/L2/L3)
+    n_lstm_layers: int = 2          # transformer blocks per level (shared)
     n_attn_heads: int = 8
     dropout: float = 0.1
 
-    # Layer tap bands (inclusive; index 0 = CNN output, 1..N = transformer layers)
-    tap_acoustic_start: int = 1
-    tap_acoustic_end: int = 8
-    tap_lexical_start: int = 13
-    tap_lexical_end: int = 20
+    # Layer tap bands (explicit tuples; index 0 = CNN output, 1..N = transformer layers)
+    level1_tap_layers: Tuple[int, ...] = (1, 2, 3, 4)
+    level2_tap_layers: Tuple[int, ...] = (5, 6, 7, 8)
+    level3_tap_layers: Tuple[int, ...] = (9, 10, 11, 12)
 
     # Masking
-    mask_prob_acoustic: float = 0.25
-    mask_prob_lexical: float = 0.15
+    level1_mask_prob: float = 0.25  # ChunkMasker
+    level2_mask_prob: float = 0.15  # FrameMasker
+    level3_mask_prob: float = 0.10  # FrameMasker
     chunk_min_span: int = 2
     chunk_max_span: int = 5
 
-    # Causal attention lookahead (frames).  0 = strictly causal; 9 matches backbone.
+    # Causal attention lookahead (frames). 0 = strictly causal.
     causal_lookahead: int = 0
 
-    # Backbone chunk-causal context (frames of 20ms each)
+    # Backbone chunk-causal context (frames of 20ms each).
     main_context: int = 8
     right_context: int = 2
 
-    # Iterative refinement (run Level 2 a second time with bottom-up error)
-    iterative_refine: bool = False
-
-    # Inhibition
+    # Inhibition (L2 only) — codebook-style cohort competition
+    inhib_num_codes: int = 320      # learned prototype vectors (~wav2vec2 codebook size)
     inhib_temperature: float = 1.0
     inhib_top_k: int = 64
 
     # Loss
     lambda1: float = 1.0
     lambda2: float = 1.0
+    lambda3: float = 1.0
     loss_type: str = "l1"           # 'l1', 'mse', 'cosine'
 
     # Training
@@ -61,7 +60,7 @@ class HPSNConfig:
     max_train_samples: int = 0      # 0 = use full dataset
 
     # Logging / checkpointing
-    output_dir: str = "./preflight_output"
+    output_dir: str = "./hpsn_output"
     logging_steps: int = 50
     save_steps: int = 5000
     seed: int = 42
