@@ -1,13 +1,15 @@
 """HPSN feature extractor for MEG-MASC evaluation.
 
 Runs each stimulus through the frozen wav2vec-S backbone and the trained
-HPSN module (eval mode, masking bypassed) and emits four conditions per
-stimulus:
+3-level HPSN module (eval mode, masking bypassed) and emits six conditions
+per stimulus:
 
-    baseline_low : [T, H]   — acoustic-band tap  (layers 1-8)
-    baseline_mid : [T, H]   — lexical-band tap   (layers 13-20)
-    hpsn_l1      : [T, D]   — Level-1 representation  (D = lstm_dim, 512)
-    hpsn_l2      : [T, D]   — Level-2 representation
+    baseline_low  : [T, H]   — L1-band tap (acoustic, e.g. layers 1-4)
+    baseline_mid  : [T, H]   — L2-band tap (lexical,  e.g. layers 5-8)
+    baseline_high : [T, H]   — L3-band tap (semantic, e.g. layers 9-12)
+    hpsn_l1       : [T, D]   — Level-1 representation  (D = lstm_dim, 512)
+    hpsn_l2       : [T, D]   — Level-2 representation
+    hpsn_l3       : [T, D]   — Level-3 representation
 
 Native wav2vec-S frame rate is 50 Hz (hop = 320 samples at 16 kHz).  When
 ``resample_opt="REPR"`` the features are upsampled 2× via linear
@@ -28,7 +30,7 @@ from tqdm import tqdm
 
 from ..config import HPSNConfig
 from ..model.backbone import FrozenWav2VecS
-from ..model.hpsn import HPSNMinimal
+from ..model.hpsn import HPSN
 
 
 SR_DEFAULT = 16_000
@@ -79,12 +81,12 @@ def load_hpsn_from_checkpoint(
     ckpt_path: str | os.PathLike,
     config: HPSNConfig,
     device: torch.device | str = "cpu",
-) -> HPSNMinimal:
-    """Instantiate ``HPSNMinimal`` and load weights from ``ckpt_path``."""
+) -> HPSN:
+    """Instantiate ``HPSN`` and load weights from ``ckpt_path``."""
     sd_file = _find_state_dict_file(Path(ckpt_path))
     state_dict = _load_state_dict(sd_file)
 
-    hpsn = HPSNMinimal(config)
+    hpsn = HPSN(config)
     missing, unexpected = hpsn.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"[features] WARNING: {len(missing)} missing keys (e.g. {missing[:3]})")
@@ -145,12 +147,13 @@ class HPSNFeatureExtractor:
     # ── core forward ────────────────────────────────────────────────────────
     @torch.no_grad()
     def extract(self, waveform: np.ndarray) -> Dict[str, np.ndarray]:
-        """Run a mono 16 kHz waveform through backbone + HPSN, return 4 conditions.
+        """Run a mono 16 kHz waveform through backbone + HPSN, return 6 conditions.
 
         Returns
         -------
-        dict with keys {baseline_low, baseline_mid, hpsn_l1, hpsn_l2}, each
-        ``np.float32`` of shape ``[T, D_cond]``.
+        dict with keys {baseline_low, baseline_mid, baseline_high,
+        hpsn_l1, hpsn_l2, hpsn_l3}, each ``np.float32`` of shape
+        ``[T, D_cond]``.
         """
         if waveform.ndim != 1:
             waveform = waveform.squeeze()
@@ -163,20 +166,26 @@ class HPSNFeatureExtractor:
         # Cast to fp32 for HPSN (trained fp32)
         hs_fp32 = tuple(h.float() for h in hidden_states)
 
-        # Taps (baseline conditions) — use the learned scalar mixes
-        baseline_low = self.hpsn.tap_acoustic(hs_fp32)   # [1, T, H]
-        baseline_mid = self.hpsn.tap_lexical(hs_fp32)    # [1, T, H]
+        # Per-band taps (baseline conditions) — learned ELMo-style scalar mixes.
+        # The 3-level model exposes them as tap1 (L1 band), tap2 (L2 band),
+        # tap3 (L3 band).
+        baseline_low = self.hpsn.tap1(hs_fp32)   # [1, T, H]
+        baseline_mid = self.hpsn.tap2(hs_fp32)   # [1, T, H]
+        baseline_high = self.hpsn.tap3(hs_fp32)  # [1, T, H]
 
         # Full HPSN forward (masking bypassed because .eval())
         out = self.hpsn(hs_fp32, attention_mask=None)
         hpsn_l1 = out["level1_repr"]   # [1, T, D]
         hpsn_l2 = out["level2_repr"]   # [1, T, D]
+        hpsn_l3 = out["level3_repr"]   # [1, T, D]
 
         feats = {
             "baseline_low": baseline_low,
             "baseline_mid": baseline_mid,
+            "baseline_high": baseline_high,
             "hpsn_l1": hpsn_l1,
             "hpsn_l2": hpsn_l2,
+            "hpsn_l3": hpsn_l3,
         }
 
         if self.resample_opt == "REPR":
@@ -198,7 +207,10 @@ def _linear_upsample_2x(x: torch.Tensor) -> torch.Tensor:
 # HDF5 writer
 # ─────────────────────────────────────────────────────────────────────────────
 
-CONDITIONS = ("baseline_low", "baseline_mid", "hpsn_l1", "hpsn_l2")
+CONDITIONS = (
+    "baseline_low", "baseline_mid", "baseline_high",
+    "hpsn_l1", "hpsn_l2", "hpsn_l3",
+)
 
 
 def extract_to_hdf5(

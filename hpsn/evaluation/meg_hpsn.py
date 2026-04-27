@@ -1,13 +1,14 @@
-"""HPSN preflight ridge-TRF encoding (E1 = hpsn_l1, E2 = hpsn_l2).
+"""HPSN preflight ridge-TRF encoding (E1 = hpsn_l1, E2 = hpsn_l2, E3 = hpsn_l3).
 
 Thin orchestrator around the existing HPSN evaluation machinery in
-``proc_5_hpsn_ridge.py``. For each (subject, session) in the requested sweep,
-fits ridge encoding for BOTH conditions E1 and E2 in one pass, reusing the
-HPSN feature HDF5 and MEG cache. Emits one "ladder" pkl per (subj, ses)
-holding both conditions side-by-side, so you can eyeball HPSN-Level-1 vs
-HPSN-Level-2 encoding performance before running the full ablation grid.
+``hpsn_ridge.py``. For each (subject, session) in the requested sweep,
+fits ridge encoding for ALL three conditions E1, E2, E3 in one pass,
+reusing the HPSN feature HDF5 and MEG cache. Emits one "ladder" pkl per
+(subj, ses) holding all conditions side-by-side, so you can eyeball
+HPSN-Level-{1,2,3} encoding performance before running the full ablation
+grid.
 
-See ``minimal-2.md`` §9.3 for the ladder naming (E1 / E2).
+See ``minimal-2.md`` §9.3 for the ladder naming (E1 / E2 / E3).
 
 Usage
 -----
@@ -50,12 +51,11 @@ from .features import (
     _load_state_dict,
     extract_to_hdf5,
 )
-from .proc_5_hpsn_ridge import (
+from .hpsn_ridge import (
     BIDS_ROOT,
     DEFAULT_TRF_TMAX,
     DEFAULT_TRF_TMIN,
     PCA_COMPONENTS,
-    PREPROCESSING_TAG,
     RESULTS_DIR,
     SOURCE_DATA_DIR,
     SR,
@@ -67,17 +67,20 @@ from .proc_5_hpsn_ridge import (
     fit_ridge_cv_single_lag,
     get_subjects,
     load_roi_run,
-    load_sensor_run,
     parse_events_tsv,
 )
+from .baseline_meg_masc import PREPROCESSING_TAG, load_sensor_run
 
 
-# Preflight condition map — minimal-2.md §9.3 naming:
+# Preflight condition map — minimal-2.md §9.3 naming, extended for the
+# 3-level full model:
 #   E1 = HPSN Level 1 representation  (hpsn_l1)
 #   E2 = HPSN Level 2 representation  (hpsn_l2)
+#   E3 = HPSN Level 3 representation  (hpsn_l3)
 PREFLIGHT_CONDS = {
     "E1": "hpsn_l1",
     "E2": "hpsn_l2",
+    "E3": "hpsn_l3",
 }
 
 MEG_MASC_SESSIONS = (0, 1)
@@ -87,26 +90,30 @@ MEG_MASC_SESSIONS = (0, 1)
 # Model-size presets
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# The HPSN training pipeline (hpsn/training/train.py) rescales the default
-# Large tap ranges when it sees a shallower backbone. A Base backbone has
-# 12 transformer layers vs Large's 24, so the scale factor is 0.5 and the
-# default taps (1-8, 13-20) become (1-4, 6-10). We replicate that here so
-# that evaluating a Base-trained checkpoint doesn't require six override
-# flags.
+# Three-level HPSN: each level has its own contiguous layer band tapped
+# from the frozen wav2vec-S backbone. ``base`` mirrors the run.sh launch
+# config (L1=1-4, L2=5-8, L3=9-12). ``large`` keeps the legacy 8-layer
+# acoustic/lexical bands; the semantic band is left unset and must be
+# supplied via --tap_semantic_start/--tap_semantic_end if you ever evaluate
+# a Large checkpoint.
 #
-# Fields left as None are filled from the HPSNConfig dataclass defaults.
+# Fields left as None are filled from the HPSNConfig dataclass defaults
+# (or, for tap_semantic_* under "large", flagged as a hard error in
+# build_hpsn_config until the user provides them).
 
 MODEL_SIZE_PRESETS = {
     "large": {
         "hidden_dim": 1024,
         "tap_acoustic_start": 1, "tap_acoustic_end": 8,
         "tap_lexical_start": 13, "tap_lexical_end": 20,
+        "tap_semantic_start": None, "tap_semantic_end": None,
         "backbone_default": "biaofu-xmu/wav2vec-S-Large-ft-960h",
     },
     "base": {
         "hidden_dim": 768,
         "tap_acoustic_start": 1, "tap_acoustic_end": 4,
-        "tap_lexical_start": 6, "tap_lexical_end": 10,
+        "tap_lexical_start": 5, "tap_lexical_end": 8,
+        "tap_semantic_start": 9, "tap_semantic_end": 12,
         "backbone_default": "biaofu-xmu/wav2vec-S-Base-ft-960h"
     },
 }
@@ -140,9 +147,10 @@ def parse_args():
     )
     p.add_argument(
         "--model_size", choices=("base", "large"), default="large",
-        help="Preset for backbone size. 'base' → hidden_dim=768, taps 1-4 / 6-10 "
-             "(matches the train-time rescaling for 12-layer backbones). "
-             "'large' → hidden_dim=1024, taps 1-8 / 13-20. Individual --hidden_dim "
+        help="Preset for backbone size. 'base' → hidden_dim=768, taps "
+             "1-4 / 5-8 / 9-12 (matches run.sh full-model training). "
+             "'large' → hidden_dim=1024, taps 1-8 / 13-20 / (semantic unset; "
+             "supply via --tap_semantic_start/_end). Individual --hidden_dim "
              "and --tap_* flags override this preset.",
     )
     p.add_argument(
@@ -153,10 +161,18 @@ def parse_args():
     )
     p.add_argument("--hidden_dim", type=int, default=None,
                    help="Override backbone hidden size (preset default applies if unset).")
-    p.add_argument("--tap_acoustic_start", type=int, default=None)
-    p.add_argument("--tap_acoustic_end", type=int, default=None)
-    p.add_argument("--tap_lexical_start", type=int, default=None)
-    p.add_argument("--tap_lexical_end", type=int, default=None)
+    p.add_argument("--tap_acoustic_start", type=int, default=None,
+                   help="L1 tap band start (inclusive, 1-indexed).")
+    p.add_argument("--tap_acoustic_end", type=int, default=None,
+                   help="L1 tap band end (inclusive).")
+    p.add_argument("--tap_lexical_start", type=int, default=None,
+                   help="L2 tap band start (inclusive). Must be > tap_acoustic_end.")
+    p.add_argument("--tap_lexical_end", type=int, default=None,
+                   help="L2 tap band end (inclusive).")
+    p.add_argument("--tap_semantic_start", type=int, default=None,
+                   help="L3 tap band start (inclusive). Must be > tap_lexical_end.")
+    p.add_argument("--tap_semantic_end", type=int, default=None,
+                   help="L3 tap band end (inclusive).")
     p.add_argument("--space", choices=("sensor", "roi"), default="sensor")
     p.add_argument(
         "--resample_opt", choices=("MEG", "REPR"), default="MEG",
@@ -192,7 +208,16 @@ def parse_args():
 
 
 def build_hpsn_config(args) -> HPSNConfig:
-    """Assemble an HPSNConfig from the model-size preset and any per-field overrides."""
+    """Assemble an HPSNConfig from the model-size preset and any per-field overrides.
+
+    The new 3-level model stores per-level layer bands as ``Tuple[int, ...]``
+    on ``HPSNConfig`` (``level1_tap_layers``, ``level2_tap_layers``,
+    ``level3_tap_layers``). The CLI keeps the legacy ``--tap_<band>_start/end``
+    range form for ergonomic parity with the 2-level pipeline; we expand each
+    range into a contiguous tuple here and stash the start/end values back on
+    the config object so downstream metadata writes still work without
+    branching.
+    """
     preset = MODEL_SIZE_PRESETS[args.model_size]
     backbone = args.backbone_model or preset["backbone_default"]
     if backbone is None:
@@ -204,34 +229,72 @@ def build_hpsn_config(args) -> HPSNConfig:
         sys.exit(2)
     cfg = HPSNConfig(backbone_model=backbone)
     cfg.hidden_dim = args.hidden_dim if args.hidden_dim is not None else preset["hidden_dim"]
-    cfg.tap_acoustic_start = (
-        args.tap_acoustic_start if args.tap_acoustic_start is not None
-        else preset["tap_acoustic_start"]
-    )
-    cfg.tap_acoustic_end = (
-        args.tap_acoustic_end if args.tap_acoustic_end is not None
-        else preset["tap_acoustic_end"]
-    )
-    cfg.tap_lexical_start = (
-        args.tap_lexical_start if args.tap_lexical_start is not None
-        else preset["tap_lexical_start"]
-    )
-    cfg.tap_lexical_end = (
-        args.tap_lexical_end if args.tap_lexical_end is not None
-        else preset["tap_lexical_end"]
-    )
-    if cfg.tap_acoustic_end >= cfg.tap_lexical_start:
+
+    def _resolve(name):
+        cli = getattr(args, name)
+        return cli if cli is not None else preset[name]
+
+    bands = {
+        "acoustic": (_resolve("tap_acoustic_start"), _resolve("tap_acoustic_end")),
+        "lexical":  (_resolve("tap_lexical_start"),  _resolve("tap_lexical_end")),
+        "semantic": (_resolve("tap_semantic_start"), _resolve("tap_semantic_end")),
+    }
+    for band, (s, e) in bands.items():
+        if s is None or e is None:
+            print(
+                f"ERROR: tap_{band}_start/end is unset. The {args.model_size} preset "
+                f"does not provide a default for the {band} (L3) band — supply "
+                f"--tap_{band}_start and --tap_{band}_end explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if s > e:
+            print(
+                f"ERROR: tap_{band}_start ({s}) > tap_{band}_end ({e}).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    ac_s, ac_e = bands["acoustic"]
+    lx_s, lx_e = bands["lexical"]
+    sm_s, sm_e = bands["semantic"]
+    if ac_e >= lx_s:
         print(
-            f"ERROR: tap_acoustic_end ({cfg.tap_acoustic_end}) must be strictly less than "
-            f"tap_lexical_start ({cfg.tap_lexical_start}).",
+            f"ERROR: tap_acoustic_end ({ac_e}) must be strictly less than "
+            f"tap_lexical_start ({lx_s}).",
             file=sys.stderr,
         )
         sys.exit(2)
+    if lx_e >= sm_s:
+        print(
+            f"ERROR: tap_lexical_end ({lx_e}) must be strictly less than "
+            f"tap_semantic_start ({sm_s}).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    cfg.level1_tap_layers = tuple(range(ac_s, ac_e + 1))
+    cfg.level2_tap_layers = tuple(range(lx_s, lx_e + 1))
+    cfg.level3_tap_layers = tuple(range(sm_s, sm_e + 1))
+
+    # Preserve the start/end fields on the config object for metadata logging.
+    # These attributes don't exist on HPSNConfig itself (the dataclass uses
+    # tuples) but Python will accept them via __dict__ as long as the
+    # dataclass isn't frozen, which it isn't.
+    cfg.tap_acoustic_start, cfg.tap_acoustic_end = ac_s, ac_e
+    cfg.tap_lexical_start,  cfg.tap_lexical_end  = lx_s, lx_e
+    cfg.tap_semantic_start, cfg.tap_semantic_end = sm_s, sm_e
     return cfg
 
 
 def check_checkpoint_matches_config(ckpt_path, cfg: HPSNConfig) -> None:
-    """Read the ckpt state_dict and fail loudly on shape mismatch before we try to load."""
+    """Read the ckpt state_dict and fail loudly on shape mismatch before we try to load.
+
+    Keys for the 3-level model:
+      - tap1.weights, tap2.weights, tap3.weights   (LayerTap learnable mixes)
+      - level{1,2,3}.input_proj.weight             [lstm_dim, hidden_dim]
+      - level{1,2,3}.recon_head.weight             [hidden_dim, lstm_dim]
+    """
     sd_file = _find_state_dict_file(Path(ckpt_path))
     sd = _load_state_dict(sd_file)
 
@@ -239,42 +302,64 @@ def check_checkpoint_matches_config(ckpt_path, cfg: HPSNConfig) -> None:
         t = sd.get(key, None)
         return tuple(t.shape) if t is not None else None
 
-    tap_ac = _shape("tap_acoustic.weights")
-    tap_lex = _shape("tap_lexical.weights")
-    l1_in = _shape("level1.input_proj.weight")          # [lstm_dim, hidden_dim]
-    l1_recon = _shape("level1.recon_head.weight")       # [hidden_dim, lstm_dim]
+    tap1 = _shape("tap1.weights")
+    tap2 = _shape("tap2.weights")
+    tap3 = _shape("tap3.weights")
+    l1_in    = _shape("level1.input_proj.weight")     # [lstm_dim, hidden_dim]
+    l1_recon = _shape("level1.recon_head.weight")     # [hidden_dim, lstm_dim]
+    l2_recon = _shape("level2.recon_head.weight")
+    l3_recon = _shape("level3.recon_head.weight")
 
-    expected_ac = cfg.tap_acoustic_end - cfg.tap_acoustic_start + 1
-    expected_lex = cfg.tap_lexical_end - cfg.tap_lexical_start + 1
+    expected_l1 = cfg.tap_acoustic_end - cfg.tap_acoustic_start + 1
+    expected_l2 = cfg.tap_lexical_end  - cfg.tap_lexical_start  + 1
+    expected_l3 = cfg.tap_semantic_end - cfg.tap_semantic_start + 1
 
     problems = []
-    if tap_ac is not None and tap_ac[0] != expected_ac:
+    if tap1 is not None and tap1[0] != expected_l1:
         problems.append(
-            f"  tap_acoustic length: checkpoint={tap_ac[0]}, configured={expected_ac} "
+            f"  tap1 length: checkpoint={tap1[0]}, configured={expected_l1} "
             f"(range {cfg.tap_acoustic_start}-{cfg.tap_acoustic_end})"
         )
-    if tap_lex is not None and tap_lex[0] != expected_lex:
+    if tap2 is not None and tap2[0] != expected_l2:
         problems.append(
-            f"  tap_lexical length:  checkpoint={tap_lex[0]}, configured={expected_lex} "
+            f"  tap2 length: checkpoint={tap2[0]}, configured={expected_l2} "
             f"(range {cfg.tap_lexical_start}-{cfg.tap_lexical_end})"
+        )
+    if tap3 is not None and tap3[0] != expected_l3:
+        problems.append(
+            f"  tap3 length: checkpoint={tap3[0]}, configured={expected_l3} "
+            f"(range {cfg.tap_semantic_start}-{cfg.tap_semantic_end})"
         )
     if l1_in is not None and l1_in[1] != cfg.hidden_dim:
         problems.append(
-            f"  hidden_dim:          checkpoint={l1_in[1]}, configured={cfg.hidden_dim}"
+            f"  hidden_dim: checkpoint={l1_in[1]}, configured={cfg.hidden_dim}"
         )
-    if l1_recon is not None and l1_recon[0] != cfg.hidden_dim:
+    for name, sh in (("level1", l1_recon), ("level2", l2_recon), ("level3", l3_recon)):
+        if sh is not None and sh[0] != cfg.hidden_dim:
+            problems.append(
+                f"  {name}.recon_head hidden: checkpoint={sh[0]}, "
+                f"configured={cfg.hidden_dim}"
+            )
+
+    # Hard error if the 3-level checkpoint is missing L3 keys entirely
+    # (i.e. someone pointed --ckpt at a legacy 2-level checkpoint).
+    legacy_keys = ("tap_acoustic.weights", "tap_lexical.weights")
+    if any(k in sd for k in legacy_keys) and tap3 is None:
         problems.append(
-            f"  recon_head hidden:   checkpoint={l1_recon[0]}, configured={cfg.hidden_dim}"
+            "  This appears to be a legacy 2-level (HPSNMinimal) checkpoint "
+            "(found tap_acoustic / tap_lexical, no tap3). Re-train with the "
+            "3-level model in run.sh, or point --ckpt at a full-model checkpoint."
         )
 
     if problems:
         hint_base = (
             "try --model_size base "
-            "(presets hidden_dim=768, taps 1-4 / 6-10)."
+            "(presets hidden_dim=768, taps 1-4 / 5-8 / 9-12)."
         )
         hint_overrides = (
             "You can also override per-field: --hidden_dim, "
-            "--tap_acoustic_start/end, --tap_lexical_start/end."
+            "--tap_acoustic_start/end, --tap_lexical_start/end, "
+            "--tap_semantic_start/end."
         )
         print(
             "ERROR: HPSN checkpoint shape does not match the configured model.\n"
@@ -364,7 +449,8 @@ def _maybe_pca(X_all, cond_label):
     if X_all.shape[1] <= PCA_COMPONENTS:
         return X_all
     active_mask = np.abs(X_all).sum(1) > 0
-    pca = PCA(n_components=PCA_COMPONENTS)
+    pca = PCA(n_components=PCA_COMPONENTS, svd_solver="randomized",
+              random_state=0)
     pca.fit(X_all[active_mask])
     X = pca.transform(X_all).astype(np.float64)
     print(f"    PCA on {cond_label}: "
@@ -476,6 +562,7 @@ def preflight_one_subject_session(
             hidden_dim=cfg.hidden_dim,
             tap_acoustic=(cfg.tap_acoustic_start, cfg.tap_acoustic_end),
             tap_lexical=(cfg.tap_lexical_start, cfg.tap_lexical_end),
+            tap_semantic=(cfg.tap_semantic_start, cfg.tap_semantic_end),
             hdf5_path=str(h5_file.filename) if h5_file is not None else None,
             preprocessing=PREPROCESSING_TAG,
             created_at=datetime.datetime.now().isoformat(timespec="seconds"),
@@ -518,7 +605,7 @@ def main():
     log_stage("Stage 1/4: Configuration")
     print(f"Subjects      : {subjects}")
     print(f"Sessions      : {sessions}")
-    print(f"Conditions    : E1→hpsn_l1, E2→hpsn_l2")
+    print(f"Conditions    : E1→hpsn_l1, E2→hpsn_l2, E3→hpsn_l3")
     print(f"Model size    : {args.model_size}")
     print(f"Backbone      : {cfg.backbone_model}")
     print(f"Hidden dim    : {cfg.hidden_dim}")
@@ -526,6 +613,8 @@ def main():
           f"(len {cfg.tap_acoustic_end - cfg.tap_acoustic_start + 1})")
     print(f"Tap lexical   : {cfg.tap_lexical_start}-{cfg.tap_lexical_end} "
           f"(len {cfg.tap_lexical_end - cfg.tap_lexical_start + 1})")
+    print(f"Tap semantic  : {cfg.tap_semantic_start}-{cfg.tap_semantic_end} "
+          f"(len {cfg.tap_semantic_end - cfg.tap_semantic_start + 1})")
     print(f"Space         : {args.space}")
     print(f"Resample opt  : {RESAMPLE_OPT}  (MEG rate = {MEG_RATE} Hz)")
     print(f"Checkpoint    : {args.ckpt}")

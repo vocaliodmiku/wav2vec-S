@@ -22,14 +22,18 @@ Usage
 
 Conditions (``--feat``)
     acoustic                  — gammatone-8 + onset-8 + word-onset (17 feats)
-    baseline_low              — wav2vec-S acoustic-band tap  (H=1024)
-    baseline_mid              — wav2vec-S lexical-band tap   (H=1024)
-    hpsn_l1                   — HPSN Level-1 representation  (D=512)
-    hpsn_l2                   — HPSN Level-2 representation  (D=512)
+    baseline_low              — wav2vec-S L1-band tap (acoustic, H)
+    baseline_mid              — wav2vec-S L2-band tap (lexical,  H)
+    baseline_high             — wav2vec-S L3-band tap (semantic, H)
+    hpsn_l1                   — HPSN Level-1 representation (D=512)
+    hpsn_l2                   — HPSN Level-2 representation (D=512)
+    hpsn_l3                   — HPSN Level-3 representation (D=512)
     combined_baseline_low     — acoustic + PCA(baseline_low)
     combined_baseline_mid     — acoustic + PCA(baseline_mid)
+    combined_baseline_high    — acoustic + PCA(baseline_high)
     combined_hpsn_l1          — acoustic + PCA(hpsn_l1)
     combined_hpsn_l2          — acoustic + PCA(hpsn_l2)
+    combined_hpsn_l3          — acoustic + PCA(hpsn_l3)
 """
 from __future__ import annotations
 
@@ -50,6 +54,7 @@ import pandas as pd
 import torch
 from gammatone.filters import centre_freqs as _gt_centre_freqs
 from gammatone.gtgram import gtgram
+from scipy.linalg import cho_factor, cho_solve
 from scipy.signal import resample_poly
 from sklearn.decomposition import PCA
 from sklearn.linear_model import RidgeCV
@@ -77,16 +82,15 @@ from .features import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 BIDS_ROOT = Path(
-    "/scratch/jsm04005/fie24002/DATA/meg-masc/meg_masc_tmp/Part-1/osfstorage"
+    "/scratch/jsm04005/fie24002/DATA/gwilliams2022/download/osfstorage/"
 )
 BIDS_ROOT_P2 = Path(
     "/scratch/jsm04005/fie24002/DATA/meg-masc/meg_masc_tmp/Part-2/osfstorage"
 )
 RESULTS_DIR = Path(
-    "/scratch/jsm04005/fie24002/DATA/HPSN/EvalResults/meg_results"
+    "/scratch/jsm04005/fie24002/DATA/HPSN/EvalResults-L/meg_results"
 )
 SOURCE_DATA_DIR = Path(
-    "/scratch/jsm04005/fie24002/DATA/L360-Word20000-5L-512-CNN/"
     "EvalResults/meg_results/source_data"
 )
 
@@ -102,14 +106,17 @@ N_ACOUSTIC_PREDICTORS = 17  # 8 gammatone + 8 onset + 1 word onset
 
 # Ridge
 RIDGE_ALPHAS = np.logspace(-2, 8, 10)
-N_FOLDS = 5
+N_FOLDS = 4
 PCA_COMPONENTS = 200
 
 # Default TRF window (used when --per_lag is NOT set)
 DEFAULT_TRF_TMIN = -0.100
 DEFAULT_TRF_TMAX = 1.000
 
-BASELINE_CONDS = ("baseline_low", "baseline_mid", "hpsn_l1", "hpsn_l2")
+BASELINE_CONDS = (
+    "baseline_low", "baseline_mid", "baseline_high",
+    "hpsn_l1", "hpsn_l2", "hpsn_l3",
+)
 COMBINED_CONDS = tuple(f"combined_{c}" for c in BASELINE_CONDS)
 ALL_FEATS = ("acoustic",) + BASELINE_CONDS + COMBINED_CONDS
 
@@ -379,30 +386,89 @@ def load_roi_run(source_data_dir: Path, subj: str, ses: int, task: int):
 # Ridge fitting
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fit_ridge_cv_full_lags(X_lagged, Y_all, n_folds=N_FOLDS):
-    """Return r_values [n_sensors], coef_full [n_sensors, n_lag_feats], fold_alphas."""
-    T_total, _ = X_lagged.shape
+def fit_ridge_cv_full_lags(X_lagged, Y_all, n_folds=N_FOLDS, alphas=RIDGE_ALPHAS):
+    """K-fold ridge with GCV-calibrated α and Gram-based block updates.
+
+    Replaces the previous loop of N_FOLDS+1 ``RidgeCV`` fits (each costing a
+    full SVD of the (T, D) lagged matrix) with one D×D eigendecomp shared
+    across all folds:
+      1. Compute ``XtX_full = X.T @ X`` and ``XtY_full = X.T @ Y`` once.
+      2. Eigendecompose ``XtX_full`` to score every α in ``alphas`` via GCV
+         in closed form → α*.
+      3. ``coef_full`` falls out of the eigendecomp at α*.
+      4. Per fold k, ``XtX_train_k = XtX_full − X_k.T @ X_k`` (block update),
+         then a Cholesky solve at fixed α* yields the held-out predictions.
+
+    α is shared across folds: per-fold α was already converging to the same
+    value in practice, so we calibrate once globally instead of K+1 times.
+
+    Returns
+    -------
+    r_values    : (n_sensors,) Pearson r vs concatenated held-out predictions
+    coef_full   : (n_sensors, D) full-data coefficients at α*
+    fold_alphas : list[float] (length n_folds, all = α*; output-shape compat)
+    full_alpha  : float, α* selected by GCV
+    """
+    T, D = X_lagged.shape
     n_sensors = Y_all.shape[0]
-    Y_pred = np.zeros((T_total, n_sensors), dtype=np.float64)
-    fold_size = T_total // n_folds
-    fold_alphas = []
+    Y_T = Y_all.T  # (T, n_sensors)
+
+    # 1) Full-data Gram and X^T Y in one pass.
+    XtX_full = X_lagged.T @ X_lagged                       # (D, D)
+    XtY_full = X_lagged.T @ Y_T                            # (D, n_sensors)
+
+    # 2) Eigendecomp of XtX_full → GCV scoring for every α (no T×D SVD).
+    eigvals, V = np.linalg.eigh(XtX_full)
+    eigvals = np.clip(eigvals, 0.0, None)                  # numerical floor
+    c = V.T @ XtY_full                                     # (D, n_sensors)
+    y_norm_sq = float((Y_T ** 2).sum())                    # ‖Y‖² (sum over sensors+time)
+    best_alpha, best_score = float(alphas[0]), np.inf
+    for alpha in alphas:
+        denom = eigvals + alpha
+        c_sq = c ** 2
+        yty = float((c_sq / denom[:, None]).sum())
+        ypy = float(((eigvals / denom ** 2)[:, None] * c_sq).sum())
+        residual_sq = max(y_norm_sq - 2.0 * yty + ypy, 0.0)
+        trace_h = float((eigvals / denom).sum())
+        gcv = residual_sq / max(T - trace_h, 1e-12) ** 2
+        if gcv < best_score:
+            best_score, best_alpha = gcv, float(alpha)
+    alpha_star = best_alpha
+    print(f"    GCV α* = {alpha_star:.2e}  (shared across {n_folds} folds)")
+
+    # 3) coef_full at α* via the eigendecomp; free V/c afterwards (~1 GB).
+    coef_full = (V @ ((1.0 / (eigvals + alpha_star))[:, None] * c)).T
+    del V, c, eigvals
+
+    # 4) Per-fold Cholesky on (XtX_full − XtX_te + α* I) for held-out preds.
+    Y_pred = np.zeros((T, n_sensors), dtype=np.float64)
+    fold_size = T // n_folds
+    fold_alphas: list[float] = []
     for fold in range(n_folds):
         t0 = fold * fold_size
-        t1 = (fold + 1) * fold_size if fold < n_folds - 1 else T_total
-        train_mask = np.ones(T_total, dtype=bool)
-        train_mask[t0:t1] = False
-        ridge = RidgeCV(alphas=RIDGE_ALPHAS)
-        ridge.fit(X_lagged[train_mask], Y_all[:, train_mask].T)
-        Y_pred[t0:t1] = ridge.predict(X_lagged[t0:t1])
-        fold_alphas.append(float(ridge.alpha_))
-        print(f"    Fold {fold+1}/{n_folds}: alpha = {ridge.alpha_:.2e}")
+        t1 = (fold + 1) * fold_size if fold < n_folds - 1 else T
+        X_te = X_lagged[t0:t1]
+        Y_te_T = Y_T[t0:t1]
+        XtX_te = X_te.T @ X_te
+        XtY_te = X_te.T @ Y_te_T
+
+        A = XtX_full - XtX_te
+        A.flat[::D + 1] += alpha_star                      # in-place A += α I
+        B = XtY_full - XtY_te
+        try:
+            c_low = cho_factor(A, lower=True, overwrite_a=True)
+            beta = cho_solve(c_low, B, overwrite_b=True)
+        except np.linalg.LinAlgError:
+            beta = np.linalg.solve(A, B)
+
+        Y_pred[t0:t1] = X_te @ beta
+        fold_alphas.append(alpha_star)
+        print(f"    Fold {fold + 1}/{n_folds}: α = {alpha_star:.2e}")
+
     r_values = np.array([
         np.corrcoef(Y_all[i], Y_pred[:, i])[0, 1] for i in range(n_sensors)
     ])
-
-    ridge_full = RidgeCV(alphas=RIDGE_ALPHAS)
-    ridge_full.fit(X_lagged, Y_all.T)
-    return r_values, ridge_full.coef_, fold_alphas, float(ridge_full.alpha_)
+    return r_values, coef_full, fold_alphas, alpha_star
 
 
 def fit_ridge_cv_single_lag(X_lag, Y_all, n_folds=N_FOLDS):
@@ -620,7 +686,8 @@ def main():
         X_cond = X_all[:, N_ACOUSTIC_PREDICTORS:]
         if cond_dim > PCA_COMPONENTS:
             active_mask = np.abs(X_cond).sum(1) > 0
-            pca = PCA(n_components=PCA_COMPONENTS)
+            pca = PCA(n_components=PCA_COMPONENTS, svd_solver="randomized",
+                      random_state=0)
             pca.fit(X_cond[active_mask])
             X_cond = pca.transform(X_cond).astype(np.float64)
             print(f"PCA on {FEAT[len('combined_'):]}: "
@@ -628,7 +695,8 @@ def main():
         X_all = np.concatenate([X_aco_cat, X_cond], axis=1)
     elif FEAT in BASELINE_CONDS and X_all.shape[1] > PCA_COMPONENTS:
         active_mask = np.abs(X_all).sum(1) > 0
-        pca = PCA(n_components=PCA_COMPONENTS)
+        pca = PCA(n_components=PCA_COMPONENTS, svd_solver="randomized",
+                  random_state=0)
         pca.fit(X_all[active_mask])
         X_all = pca.transform(X_all).astype(np.float64)
         print(f"PCA on {FEAT}: {pca.explained_variance_ratio_.sum():.2%} var")

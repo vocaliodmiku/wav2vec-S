@@ -9,11 +9,23 @@ Auto-globs ``trf_ridge_{feat}_{space}_{resample}_sub-*_ses-*.pkl`` under
     (Fisher-z mean across subjects; sessions averaged within subject first).
   - ``figs/violin_{mean_r,top20_mean,top10pct_mean}.png`` — per-subject
     distributions per feature.
+  - ``figs/layer_trajectory_{stat}.png`` — when the run includes a
+    wav2vec2 layer sweep (feats matching ``w2v2_lN`` / ``w2v2rand_lN``),
+    a per-stat trajectory across layer index, with separate lines for
+    pretrained vs random-init families and an optional baseline_feat
+    horizontal reference.
   - ``report.md`` — pointer to the CSV + figures, with a summary table.
 
-If ``--baseline_feat`` is set, Δ(feat − baseline_feat) per-subject stats and
-topomaps are emitted alongside each non-baseline feat, mirroring the HPSN
-preflight report's E2 − E1 contrast.
+w2v2 feat naming (set by ``baseline_meg_masc.py``):
+    ``w2v2_lN``       — pretrained wav2vec2-large hidden state at tap N
+    ``w2v2rand_lN``   — random-init control at tap N
+    (N = 0 means post-CNN/pre-transformer; N ∈ [1, num_hidden_layers] are
+    transformer outputs.)
+
+If ``--baseline_feat`` is set, Δ(feat − baseline_feat) per-subject stats,
+topomaps, and (for w2v2 layer sweeps) Δ-trajectory plots are emitted
+alongside each non-baseline feat, mirroring the HPSN preflight report's
+E2 − E1 contrast.
 
 Only pkls fit in ``full_lags`` mode are processed (per-lag pkls are skipped).
 
@@ -88,6 +100,27 @@ def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
 
 
+W2V2_LAYER_RE = re.compile(r"^(w2v2(?:rand)?)_l(\d+)$")
+W2V2_LAYER_DELTA_RE = re.compile(r"^Δ\[(w2v2(?:rand)?)_l(\d+)−.+\]$")
+
+
+def _w2v2_layer_info(feat: str) -> tuple[str, int] | None:
+    """``(family, layer_idx)`` for w2v2 layer feats / Δ-labels, else None."""
+    m = W2V2_LAYER_RE.match(feat) or W2V2_LAYER_DELTA_RE.match(feat)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None
+
+
+def _feat_sort_key(feat: str):
+    """Order non-w2v2 feats first (alphabetical), then w2v2 by family + layer."""
+    info = _w2v2_layer_info(feat)
+    if info is None:
+        return (0, feat, 0)
+    family, layer_idx = info
+    return (1, family, layer_idx)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pkl discovery & loading
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +185,63 @@ def plot_topomap(r_per_sensor, info, title, out_path, *, symmetric=False):
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+def plot_layer_trajectory(
+    df: pd.DataFrame,
+    conds: list[str],
+    stat: str,
+    out_path: Path,
+    *,
+    baseline_feat: str | None = None,
+    title_suffix: str = "",
+) -> bool:
+    """Plot ``stat`` (mean ± SEM across subjects) vs w2v2 layer index.
+
+    One line per family present in ``conds`` (``w2v2``, ``w2v2rand``).
+    Returns True iff at least one family had data and the figure was written.
+    """
+    families: dict[str, list[tuple[int, float, float]]] = {}
+    for cond in conds:
+        info = _w2v2_layer_info(cond)
+        if info is None:
+            continue
+        family, layer_idx = info
+        sub = df[df["condition"] == cond][stat].dropna().to_numpy()
+        if sub.size == 0:
+            continue
+        sem = float(sub.std(ddof=1) / np.sqrt(sub.size)) if sub.size > 1 else 0.0
+        families.setdefault(family, []).append((layer_idx, float(sub.mean()), sem))
+
+    if not families:
+        return False
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.0))
+    for family in sorted(families):
+        pts = sorted(families[family], key=lambda t: t[0])
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        es = [p[2] for p in pts]
+        ax.errorbar(xs, ys, yerr=es, marker="o", capsize=2, label=family)
+
+    if baseline_feat is not None:
+        sub = df[df["condition"] == baseline_feat][stat].dropna().to_numpy()
+        if sub.size > 0:
+            ax.axhline(
+                float(sub.mean()), ls="--", color="gray", lw=1.0,
+                label=f"{baseline_feat} mean", zorder=1,
+            )
+
+    ax.axhline(0, color="black", lw=0.4)
+    ax.set_xlabel("wav2vec2 layer (0 = post-CNN, ≥1 = transformer)")
+    ax.set_ylabel(stat)
+    ax.set_title(f"{stat} vs wav2vec2 layer{title_suffix}")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return True
 
 
 def plot_violin(per_cond_data: dict, stat_name: str, out_path: Path):
@@ -227,7 +317,7 @@ def main():
             "Pass --resample_opt to filter."
         )
 
-    feats = sorted({e["feat"] for e in entries})
+    feats = sorted({e["feat"] for e in entries}, key=_feat_sort_key)
     print(f"Features: {feats}")
     if args.baseline_feat and args.baseline_feat not in feats:
         print(
@@ -380,6 +470,33 @@ def main():
         violin_paths[stat] = pth
         print(f"Wrote {pth}")
 
+    # 7b. wav2vec2 layer-trajectory plots (only when w2v2 layer feats present).
+    # Stat-vs-layer with a line per family (w2v2 vs w2v2rand) and an optional
+    # baseline_feat horizontal reference. A second set of trajectories is
+    # emitted on the Δ[w2v2_lN−base] rows when baseline_feat is set.
+    trajectory_paths: dict = {}
+    has_w2v2_layers = any(_w2v2_layer_info(f) is not None for f in feats)
+    if has_w2v2_layers:
+        for stat in STATS:
+            pth = figs_dir / f"layer_trajectory_{stat}.png"
+            if plot_layer_trajectory(
+                df, list(feats), stat, pth,
+                baseline_feat=args.baseline_feat,
+            ):
+                trajectory_paths[stat] = pth
+                print(f"Wrote {pth}")
+        if delta_feats:
+            delta_conds = [f"Δ[{f}−{args.baseline_feat}]" for f in delta_feats]
+            for stat in STATS:
+                pth = figs_dir / f"layer_trajectory_delta_{stat}.png"
+                if plot_layer_trajectory(
+                    df, delta_conds, stat, pth,
+                    baseline_feat=None,
+                    title_suffix=f"  (Δ vs {args.baseline_feat})",
+                ):
+                    trajectory_paths[f"delta_{stat}"] = pth
+                    print(f"Wrote {pth}")
+
     # 8. markdown report
     n_subj = df["subj"].nunique()
     header_line = f"- space: `{args.space}`"
@@ -440,6 +557,33 @@ def main():
         lines.append(f"### {stat}")
         lines.append(f"![{stat}]({rel})")
         lines.append("")
+    if trajectory_paths:
+        lines.append("## wav2vec2 layer trajectories")
+        lines.append("")
+        lines.append(
+            "Per-subject mean ± SEM at each transformer tap; layer 0 is "
+            "post-CNN/pre-transformer."
+        )
+        lines.append("")
+        for stat in STATS:
+            pth = trajectory_paths.get(stat)
+            if pth is None:
+                continue
+            rel = pth.relative_to(out_dir)
+            lines.append(f"### {stat}")
+            lines.append(f"![{stat}]({rel})")
+            lines.append("")
+        if any(f"delta_{s}" in trajectory_paths for s in STATS):
+            lines.append(f"### Δ vs `{args.baseline_feat}`")
+            lines.append("")
+            for stat in STATS:
+                pth = trajectory_paths.get(f"delta_{stat}")
+                if pth is None:
+                    continue
+                rel = pth.relative_to(out_dir)
+                lines.append(f"#### Δ {stat}")
+                lines.append(f"![Δ {stat}]({rel})")
+                lines.append("")
     lines.append("## CSV")
     lines.append(f"`{csv_path.relative_to(out_dir)}`")
     md_path = out_dir / "report.md"
