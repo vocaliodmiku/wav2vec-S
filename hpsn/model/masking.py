@@ -54,3 +54,73 @@ class FrameMasker(nn.Module):
         mask = torch.bernoulli(torch.full((B, T), self.mask_prob, device=x.device)).bool()
         masked_x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return masked_x, mask
+
+
+class _SpanMasker(nn.Module):
+    """Mask whole spans defined by an integer ID array; ID==0 → silence (skip).
+
+    The ID array (``[B, T]``) marks contiguous frames belonging to the same
+    phoneme/word/etc. (this exactly matches the layout produced by Phase 1
+    ``extract_targets.py``). A span = a maximal run of equal non-zero IDs.
+    On each batch, ``mask_prob`` fraction of the candidate spans (per sample)
+    is fully masked.
+
+    Whole-span masking is the lever that makes masked reconstruction
+    *intrinsically hierarchical*: random-frame masks can be solved by local
+    interpolation, but recovering an entire phoneme requires the model to
+    use lexical context (and recovering a whole word requires syntax).
+    """
+
+    def __init__(self, mask_prob: float = 0.20):
+        super().__init__()
+        self.mask_prob = float(mask_prob)
+
+    def _mask_one(
+        self, ids: torch.Tensor, generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Build a frame-mask for one sample's ID vector ``[T]``."""
+        T = ids.shape[0]
+        out = torch.zeros(T, dtype=torch.bool, device=ids.device)
+        # Boundary mask: True at the first frame of every new run.
+        prev = torch.cat([ids[:1] - 1, ids[:-1]])  # ensure ids[0] is a boundary
+        boundary = ids != prev
+        starts = torch.nonzero(boundary, as_tuple=False).squeeze(-1)  # [n_runs]
+        if starts.numel() == 0:
+            return out
+        ends = torch.cat([starts[1:], torch.tensor([T], device=ids.device)])
+        run_ids = ids[starts]
+        # Candidate spans = non-silence runs (id != 0).
+        cand = (run_ids != 0).nonzero(as_tuple=False).squeeze(-1)
+        if cand.numel() == 0:
+            return out
+        n_to_mask = max(1, int(round(cand.numel() * self.mask_prob)))
+        if generator is not None:
+            perm = torch.randperm(cand.numel(), generator=generator, device=ids.device)
+        else:
+            perm = torch.randperm(cand.numel(), device=ids.device)
+        chosen = cand[perm[:n_to_mask]]
+        for i in chosen.tolist():
+            out[int(starts[i].item()): int(ends[i].item())] = True
+        return out
+
+    def forward(
+        self, x: torch.Tensor, ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``x: [B, T, D]``, ``ids: [B, T]`` → ``(masked_x, mask)``."""
+        B, T, _ = x.shape
+        if not self.training or self.mask_prob <= 0.0:
+            return x, torch.zeros(B, T, dtype=torch.bool, device=x.device)
+        if ids.shape != (B, T):
+            raise ValueError(f"ids shape {tuple(ids.shape)} != x [B,T]={B, T}")
+        # Per-sample loop (small B); inner ops vectorised.
+        mask = torch.stack([self._mask_one(ids[b]) for b in range(B)], dim=0)
+        masked_x = x.masked_fill(mask.unsqueeze(-1), 0.0)
+        return masked_x, mask
+
+
+class PhonemeSpanMasker(_SpanMasker):
+    """Mask whole-phoneme spans (use ``phone_id`` from the targets HDF5)."""
+
+
+class WordSpanMasker(_SpanMasker):
+    """Mask whole-word spans (use ``word_id`` from the targets HDF5)."""

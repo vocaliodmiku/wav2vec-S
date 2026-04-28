@@ -27,7 +27,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
+import json
 import pickle
 import sys
 import warnings
@@ -81,6 +83,9 @@ PREFLIGHT_CONDS = {
     "E1": "hpsn_l1",
     "E2": "hpsn_l2",
     "E3": "hpsn_l3",
+    # Concat readout — L1⊕L2⊕L3 (synthesized in build_condition_matrix from
+    # the three per-level groups in the same H5; no re-extraction needed).
+    "Econcat": "hpsn_concat",
 }
 
 MEG_MASC_SESSIONS = (0, 1)
@@ -146,6 +151,13 @@ def parse_args():
         help="Trained HPSN checkpoint (file or accelerate dir).",
     )
     p.add_argument(
+        "--config_json", default=None,
+        help="Path to the training-time config.json (written by train.py). "
+             "Defaults to <ckpt_dir_parent>/config.json if it exists. "
+             "Pass an empty string to disable auto-loading and rely solely on "
+             "CLI flags.",
+    )
+    p.add_argument(
         "--model_size", choices=("base", "large"), default="large",
         help="Preset for backbone size. 'base' → hidden_dim=768, taps "
              "1-4 / 5-8 / 9-12 (matches run.sh full-model training). "
@@ -207,17 +219,98 @@ def parse_args():
     return p.parse_args()
 
 
+def _resolve_config_json_path(args) -> Path | None:
+    """Decide where to read the training-time config.json from.
+
+    * ``--config_json <path>`` → use that path verbatim (must exist).
+    * ``--config_json ""``     → auto-load disabled.
+    * unset                    → look for ``<ckpt_dir>/config.json`` and the
+                                  parent directory (since accelerate
+                                  ``checkpoint-N/`` lives one level below the
+                                  output_dir where train.py writes config.json).
+    """
+    if args.config_json == "":
+        return None
+    if args.config_json is not None:
+        p = Path(args.config_json)
+        if not p.is_file():
+            print(f"ERROR: --config_json {args.config_json!r} not a file",
+                  file=sys.stderr)
+            sys.exit(2)
+        return p
+    ckpt = Path(args.ckpt)
+    candidates = [
+        ckpt / "config.json",
+        ckpt.parent / "config.json",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _load_config_json(path: Path) -> HPSNConfig:
+    """Hydrate an HPSNConfig from the training-time config.json.
+
+    Tolerates extra keys (older or newer fields), tuples written as JSON
+    arrays, and missing fields (the dataclass default fills in)."""
+    with path.open() as f:
+        data = json.load(f)
+    field_names = {f.name for f in dataclasses.fields(HPSNConfig)}
+    kept = {}
+    skipped = []
+    for k, v in data.items():
+        if k not in field_names:
+            skipped.append(k)
+            continue
+        if isinstance(v, list):
+            v = tuple(v)
+        kept[k] = v
+    cfg = HPSNConfig(**kept)
+    if skipped:
+        print(f"[config] WARN: ignoring unknown config fields: {sorted(skipped)}")
+    return cfg
+
+
 def build_hpsn_config(args) -> HPSNConfig:
     """Assemble an HPSNConfig from the model-size preset and any per-field overrides.
 
-    The new 3-level model stores per-level layer bands as ``Tuple[int, ...]``
-    on ``HPSNConfig`` (``level1_tap_layers``, ``level2_tap_layers``,
-    ``level3_tap_layers``). The CLI keeps the legacy ``--tap_<band>_start/end``
-    range form for ergonomic parity with the 2-level pipeline; we expand each
-    range into a contiguous tuple here and stash the start/end values back on
-    the config object so downstream metadata writes still work without
-    branching.
+    If a training-time ``config.json`` is reachable (auto-detected next to
+    --ckpt or supplied via --config_json), its values take precedence: this
+    is the only way to recover v2 fields like ``use_v2_loss`` /
+    ``use_span_masking`` / ``n_iterations`` / ``level{N}_frozen_tap`` reliably.
+    CLI ``--tap_*`` and ``--hidden_dim`` flags can still override individual
+    fields after JSON load.
     """
+    cfg_json_path = _resolve_config_json_path(args)
+    if cfg_json_path is not None:
+        cfg = _load_config_json(cfg_json_path)
+        print(f"[config] loaded {cfg_json_path}")
+        if args.backbone_model is not None:
+            cfg.backbone_model = args.backbone_model
+        if args.hidden_dim is not None:
+            cfg.hidden_dim = args.hidden_dim
+
+        # Allow per-tap CLI overrides on top of the JSON config (rare).
+        def _override_band(band: str, attr_layers: str):
+            s = getattr(args, f"tap_{band}_start", None)
+            e = getattr(args, f"tap_{band}_end", None)
+            if s is not None and e is not None:
+                setattr(cfg, attr_layers, tuple(range(s, e + 1)))
+
+        _override_band("acoustic", "level1_tap_layers")
+        _override_band("lexical", "level2_tap_layers")
+        _override_band("semantic", "level3_tap_layers")
+
+        # Recover start/end attrs for downstream metadata (matches the CLI path).
+        cfg.tap_acoustic_start = cfg.level1_tap_layers[0]
+        cfg.tap_acoustic_end = cfg.level1_tap_layers[-1]
+        cfg.tap_lexical_start = cfg.level2_tap_layers[0]
+        cfg.tap_lexical_end = cfg.level2_tap_layers[-1]
+        cfg.tap_semantic_start = cfg.level3_tap_layers[0]
+        cfg.tap_semantic_end = cfg.level3_tap_layers[-1]
+        return cfg
+
     preset = MODEL_SIZE_PRESETS[args.model_size]
     backbone = args.backbone_model or preset["backbone_default"]
     if backbone is None:
@@ -306,9 +399,11 @@ def check_checkpoint_matches_config(ckpt_path, cfg: HPSNConfig) -> None:
     tap2 = _shape("tap2.weights")
     tap3 = _shape("tap3.weights")
     l1_in    = _shape("level1.input_proj.weight")     # [lstm_dim, hidden_dim]
-    l1_recon = _shape("level1.recon_head.weight")     # [hidden_dim, lstm_dim]
+    # v1 recon_heads are absent in v2 checkpoints (use_v2_loss=True drops them).
+    l1_recon = _shape("level1.recon_head.weight")
     l2_recon = _shape("level2.recon_head.weight")
     l3_recon = _shape("level3.recon_head.weight")
+    is_v2 = bool(getattr(cfg, "use_v2_loss", False))
 
     expected_l1 = cfg.tap_acoustic_end - cfg.tap_acoustic_start + 1
     expected_l2 = cfg.tap_lexical_end  - cfg.tap_lexical_start  + 1
@@ -334,12 +429,13 @@ def check_checkpoint_matches_config(ckpt_path, cfg: HPSNConfig) -> None:
         problems.append(
             f"  hidden_dim: checkpoint={l1_in[1]}, configured={cfg.hidden_dim}"
         )
-    for name, sh in (("level1", l1_recon), ("level2", l2_recon), ("level3", l3_recon)):
-        if sh is not None and sh[0] != cfg.hidden_dim:
-            problems.append(
-                f"  {name}.recon_head hidden: checkpoint={sh[0]}, "
-                f"configured={cfg.hidden_dim}"
-            )
+    if not is_v2:
+        for name, sh in (("level1", l1_recon), ("level2", l2_recon), ("level3", l3_recon)):
+            if sh is not None and sh[0] != cfg.hidden_dim:
+                problems.append(
+                    f"  {name}.recon_head hidden: checkpoint={sh[0]}, "
+                    f"configured={cfg.hidden_dim}"
+                )
 
     # Hard error if the 3-level checkpoint is missing L3 keys entirely
     # (i.e. someone pointed --ckpt at a legacy 2-level checkpoint).

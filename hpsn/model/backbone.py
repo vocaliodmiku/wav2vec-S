@@ -62,19 +62,53 @@ class FrozenWav2VecS(nn.Module):
 
 
 class LayerTap(nn.Module):
-    """ELMo-style learnable scalar mix over an arbitrary list of layer indices."""
+    """ELMo-style scalar mix over an arbitrary list of layer indices.
 
-    def __init__(self, layers: Sequence[int]):
+    Two modes:
+
+    * **Learnable** (default, ``frozen_layer=None``): ``weights`` is an
+      ``nn.Parameter`` of shape ``[len(layers)]``; the forward pass applies
+      softmax and mixes the selected hidden states.
+    * **Frozen one-hot** (``frozen_layer=k``, with ``k`` in ``layers``):
+      ``weights`` is a non-trainable buffer set to a one-hot at position
+      ``layers.index(k)``. No softmax is applied; the output equals
+      ``all_hidden_states[k]`` (cast to float32). This is the HPSN-v2 fix
+      for the "trained tap collapses onto easy-to-reconstruct layers"
+      failure mode — pin the tap to whichever layer of the wav2vec-S
+      backbone empirically aligns best with brain signal in the band.
+    """
+
+    def __init__(
+        self,
+        layers: Sequence[int],
+        frozen_layer: int | None = None,
+    ):
         super().__init__()
         layers = tuple(layers)
         assert len(layers) > 0, "LayerTap needs at least one layer index"
         self.layers = layers
-        self.weights = nn.Parameter(torch.zeros(len(layers)))  # softmax → uniform at init
+        self.frozen_layer = frozen_layer
+
+        if frozen_layer is None:
+            self.weights = nn.Parameter(torch.zeros(len(layers)))  # softmax → uniform at init
+        else:
+            if frozen_layer not in layers:
+                raise ValueError(
+                    f"frozen_layer={frozen_layer} not in layers={layers}"
+                )
+            w = torch.zeros(len(layers))
+            w[layers.index(frozen_layer)] = 1.0
+            # Non-trainable, moves with .to(device), saved in state_dict.
+            self.register_buffer("weights", w, persistent=True)
 
     def forward(self, all_hidden_states: List[torch.Tensor]) -> torch.Tensor:
         selected = torch.stack(
             [all_hidden_states[i].float() for i in self.layers],
             dim=0,
         )  # [n_layers, B, T, D]
-        w = F.softmax(self.weights, dim=0).view(-1, 1, 1, 1)
+        if self.frozen_layer is None:
+            w = F.softmax(self.weights, dim=0).view(-1, 1, 1, 1)
+        else:
+            # weights is already a one-hot buffer; no softmax, no gradient.
+            w = self.weights.view(-1, 1, 1, 1)
         return (selected * w).sum(dim=0)

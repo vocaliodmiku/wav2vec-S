@@ -20,8 +20,8 @@ from transformers import Wav2Vec2FeatureExtractor, get_cosine_schedule_with_warm
 from ..config import HPSNConfig
 from ..model.backbone import FrozenWav2VecS
 from ..model.hpsn import HPSN
-from .data import build_dataloader
-from .loss import HPSNLoss
+from .data import build_dataloader, build_targets_dataloader
+from .loss import HPSNLoss, HPSNV2Loss
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -173,11 +173,16 @@ def _compute_monitors(unwrapped_model: HPSN, outputs: dict) -> dict:
     recon_cos: dict[int, float] = {}
     for i in (1, 2, 3):
         mask = outputs[f"mask{i}"]
-        if mask.sum() == 0:
+        recon = outputs.get(f"recon{i}")
+        target = outputs.get(f"target{i}")
+        # In v2 mode the v1 tap-recon heads aren't built (recon=None) and the
+        # cos(recon, tap) monitor is meaningless — log NaN so per-target losses
+        # in `running` remain the source of truth.
+        if recon is None or target is None or mask.sum() == 0:
             recon_cos[i] = float("nan")
             continue
-        r = outputs[f"recon{i}"][mask].float()
-        t = outputs[f"target{i}"][mask].float()
+        r = recon[mask].float()
+        t = target[mask].float()
         recon_cos[i] = F.cosine_similarity(r, t, dim=-1).mean().item()
 
     # Top-down prediction cosine: does the higher level's prediction μ_i point
@@ -247,13 +252,75 @@ def main():
 
     model = HPSN(config)
 
-    loss_fn = HPSNLoss(
-        config.lambda1,
-        config.lambda2,
-        config.lambda3,
-        config.lambda_td,
-        config.loss_type,
-    )
+    # Frozen-tap invariant: if config requested a one-hot tap, verify the
+    # constructed LayerTap honored it. Catches the v2-era bug where
+    # ``level{N}_frozen_tap`` was added to the dataclass but the run config
+    # left it at -1, silently keeping the learnable softmax tap and letting
+    # tap weights drift to the worst-in-band layer per §17 of the
+    # construction doc.
+    def _assert_frozen_tap(tap_module, layers, frozen_idx, name):
+        if frozen_idx is None or int(frozen_idx) < 0:
+            return
+        from torch import nn as _nn
+        if isinstance(tap_module.weights, _nn.Parameter):
+            raise RuntimeError(
+                f"{name}: config asked for frozen_layer={frozen_idx} but "
+                f"tap.weights is still an nn.Parameter (learnable). "
+                f"LayerTap was not constructed with the frozen flag."
+            )
+        layers_t = tuple(layers)
+        try:
+            pos = layers_t.index(int(frozen_idx))
+        except ValueError:
+            raise RuntimeError(
+                f"{name}: frozen_layer={frozen_idx} not in layers={layers_t}"
+            )
+        w = tap_module.weights.detach().cpu()
+        expected = torch.zeros(len(layers_t))
+        expected[pos] = 1.0
+        if not torch.allclose(w, expected, atol=1e-6):
+            raise RuntimeError(
+                f"{name}: tap.weights={w.tolist()} != one-hot at layer "
+                f"{frozen_idx} (idx {pos}) over layers {layers_t}"
+            )
+
+    _assert_frozen_tap(model.tap1, config.level1_tap_layers, config.level1_frozen_tap, "tap1")
+    _assert_frozen_tap(model.tap2, config.level2_tap_layers, config.level2_frozen_tap, "tap2")
+    _assert_frozen_tap(model.tap3, config.level3_tap_layers, config.level3_frozen_tap, "tap3")
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[{_timestamp()}] [info] frozen taps: "
+            f"L1={config.level1_frozen_tap if config.level1_frozen_tap >= 0 else 'learnable'}, "
+            f"L2={config.level2_frozen_tap if config.level2_frozen_tap >= 0 else 'learnable'}, "
+            f"L3={config.level3_frozen_tap if config.level3_frozen_tap >= 0 else 'learnable'}"
+        )
+
+    if config.use_v2_loss:
+        loss_fn = HPSNV2Loss(
+            lambda_log_mel=config.lambda_log_mel,
+            lambda_phonol=config.lambda_phonol,
+            lambda_phone_id=config.lambda_phone_id,
+            lambda_gpt2_l4=config.lambda_gpt2_l4,
+            lambda_gpt2_l8=config.lambda_gpt2_l8,
+            lambda_td=config.lambda_td,
+            lambda_restore=config.lambda_restore,
+        )
+        if accelerator.is_main_process:
+            accelerator.print(
+                f"[{_timestamp()}] [info] using HPSN-v2 loss "
+                f"(λ log_mel={config.lambda_log_mel}, phonol={config.lambda_phonol}, "
+                f"phone_id={config.lambda_phone_id}, gpt2_l4={config.lambda_gpt2_l4}, "
+                f"gpt2_l8={config.lambda_gpt2_l8}, td={config.lambda_td}, "
+                f"restore={config.lambda_restore} @ p={config.restore_prob})"
+            )
+    else:
+        loss_fn = HPSNLoss(
+            config.lambda1,
+            config.lambda2,
+            config.lambda3,
+            config.lambda_td,
+            config.loss_type,
+        )
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -267,16 +334,34 @@ def main():
         num_training_steps=config.max_steps,
     )
 
-    dataloader = build_dataloader(
-        root=config.libri_root,
-        feature_extractor=feature_extractor,
-        batch_size=config.per_device_train_batch_size,
-        num_workers=config.num_workers,
-        max_audio_seconds=config.max_audio_seconds,
-        max_samples=config.max_train_samples,
-        shuffle=True,
-        sample_rate=config.sample_rate,
-    )
+    if config.use_v2_loss:
+        if not config.targets_manifest or not config.targets_h5:
+            raise SystemExit(
+                "use_v2_loss=True requires --targets_manifest and --targets_h5"
+            )
+        dataloader = build_targets_dataloader(
+            manifest_path=config.targets_manifest,
+            targets_h5_path=config.targets_h5,
+            feature_extractor=feature_extractor,
+            batch_size=config.per_device_train_batch_size,
+            num_workers=config.num_workers,
+            max_audio_seconds=config.max_audio_seconds,
+            max_samples=config.max_train_samples,
+            shuffle=True,
+            stats_path=config.target_stats or None,
+            restore_prob=config.restore_prob,
+        )
+    else:
+        dataloader = build_dataloader(
+            root=config.libri_root,
+            feature_extractor=feature_extractor,
+            batch_size=config.per_device_train_batch_size,
+            num_workers=config.num_workers,
+            max_audio_seconds=config.max_audio_seconds,
+            max_samples=config.max_train_samples,
+            shuffle=True,
+            sample_rate=config.sample_rate,
+        )
 
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
@@ -304,12 +389,22 @@ def main():
     model.train()
     step = 0
     last_log_time = time.time()
-    running = {
-        "total": 0.0,
-        "recon1": 0.0, "recon2": 0.0, "recon3": 0.0,
-        "td_2to1": 0.0, "td_3to2": 0.0,
-        "count": 0,
-    }
+    if config.use_v2_loss:
+        running = {
+            "total": 0.0,
+            "log_mel": 0.0, "phonol": 0.0, "phone_id": 0.0,
+            "gpt2_l4": 0.0, "gpt2_l8": 0.0,
+            "td_2to1": 0.0, "td_3to2": 0.0,
+            "restore": 0.0,
+            "count": 0,
+        }
+    else:
+        running = {
+            "total": 0.0,
+            "recon1": 0.0, "recon2": 0.0, "recon3": 0.0,
+            "td_2to1": 0.0, "td_3to2": 0.0,
+            "count": 0,
+        }
     last_grad_norm = float("nan")  # pre-clip global grad norm of the most recent optimizer step
     done = False
 
@@ -333,17 +428,35 @@ def main():
                             hidden_states = backbone(input_values, attention_mask=attention_mask)
                     # Keep backbone states in bf16; LayerTap casts only the tapped bands to fp32.
 
+                # v2-only inputs (None in v1)
+                phone_id = batch.get("targets", {}).get("phone_id") if config.use_v2_loss else None
+                word_id = batch.get("targets", {}).get("word_id") if config.use_v2_loss else None
+                frame_mask = batch.get("frame_mask") if config.use_v2_loss else None
+
                 with profiler.region("hpsn.forward"):
                     if hpsn_compute_dtype is not None:
                         with torch.autocast(
                             device_type=accelerator.device.type, dtype=hpsn_compute_dtype
                         ):
-                            outputs = model(hidden_states, attention_mask=attention_mask)
+                            outputs = model(
+                                hidden_states, attention_mask=attention_mask,
+                                phone_id=phone_id, word_id=word_id,
+                            )
                     else:
-                        outputs = model(hidden_states, attention_mask=attention_mask)
+                        outputs = model(
+                            hidden_states, attention_mask=attention_mask,
+                            phone_id=phone_id, word_id=word_id,
+                        )
                 with profiler.region("loss"):
-                    # Loss runs outside autocast; _recon_loss casts to fp32 internally.
-                    losses = loss_fn(outputs)
+                    # Loss runs outside autocast; recon casts to fp32 internally.
+                    if config.use_v2_loss:
+                        restore_mask = batch.get("restore_mask")
+                        losses = loss_fn(
+                            outputs, batch["targets"], frame_mask,
+                            restore_mask=restore_mask,
+                        )
+                    else:
+                        losses = loss_fn(outputs)
                     loss = losses["total"]
 
                 with profiler.region("backward"):
@@ -359,11 +472,13 @@ def main():
 
             # Accumulate for logging.
             running["total"] += loss.detach().float().item()
-            running["recon1"] += losses["recon1"].float().item()
-            running["recon2"] += losses["recon2"].float().item()
-            running["recon3"] += losses["recon3"].float().item()
-            running["td_2to1"] += losses["td_2to1"].float().item()
-            running["td_3to2"] += losses["td_3to2"].float().item()
+            if config.use_v2_loss:
+                for k in ("log_mel", "phonol", "phone_id", "gpt2_l4", "gpt2_l8",
+                          "td_2to1", "td_3to2", "restore"):
+                    running[k] += losses[k].float().item()
+            else:
+                for k in ("recon1", "recon2", "recon3", "td_2to1", "td_3to2"):
+                    running[k] += losses[k].float().item()
             running["count"] += 1
 
             if accelerator.sync_gradients:
@@ -376,12 +491,22 @@ def main():
                     mon = _compute_monitors(accelerator.unwrap_model(model), outputs)
                     rc = mon["recon_cos"]
                     tdc = mon["td_cos"]
-                    accelerator.print(
-                        f"[{_timestamp()}] step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
-                        f"| recon1/2/3 {running['recon1']/n:.4f}/{running['recon2']/n:.4f}/{running['recon3']/n:.4f} "
-                        f"| td2to1/3to2 {running['td_2to1']/n:.3f}/{running['td_3to2']/n:.3f} "
-                        f"| gnorm {last_grad_norm:.2f} | {n/max(dt,1e-6):.2f} it/s"
-                    )
+                    if config.use_v2_loss:
+                        accelerator.print(
+                            f"[{_timestamp()}] step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
+                            f"| logmel {running['log_mel']/n:.4f} phonol {running['phonol']/n:.4f} "
+                            f"phone {running['phone_id']/n:.4f} gpt2l4 {running['gpt2_l4']/n:.4f} "
+                            f"gpt2l8 {running['gpt2_l8']/n:.4f} restore {running['restore']/n:.4f} "
+                            f"| td2to1/3to2 {running['td_2to1']/n:.3f}/{running['td_3to2']/n:.3f} "
+                            f"| gnorm {last_grad_norm:.2f} | {n/max(dt,1e-6):.2f} it/s"
+                        )
+                    else:
+                        accelerator.print(
+                            f"[{_timestamp()}] step {step:>7d} | lr {lr:.2e} | total {running['total']/n:.4f} "
+                            f"| recon1/2/3 {running['recon1']/n:.4f}/{running['recon2']/n:.4f}/{running['recon3']/n:.4f} "
+                            f"| td2to1/3to2 {running['td_2to1']/n:.3f}/{running['td_3to2']/n:.3f} "
+                            f"| gnorm {last_grad_norm:.2f} | {n/max(dt,1e-6):.2f} it/s"
+                        )
                     accelerator.print(
                         f"[{_timestamp()}]         "
                         f"| alpha1/2 {mon['alpha1']:+.3f}/{mon['alpha2']:+.3f} "
@@ -393,12 +518,22 @@ def main():
                         f"tap2 {_format_tap_weights(mon['tap2_w'])} "
                         f"tap3 {_format_tap_weights(mon['tap3_w'])}"
                     )
-                    running = {
-                        "total": 0.0,
-                        "recon1": 0.0, "recon2": 0.0, "recon3": 0.0,
-                        "td_2to1": 0.0, "td_3to2": 0.0,
-                        "count": 0,
-                    }
+                    if config.use_v2_loss:
+                        running = {
+                            "total": 0.0,
+                            "log_mel": 0.0, "phonol": 0.0, "phone_id": 0.0,
+                            "gpt2_l4": 0.0, "gpt2_l8": 0.0,
+                            "td_2to1": 0.0, "td_3to2": 0.0,
+                            "restore": 0.0,
+                            "count": 0,
+                        }
+                    else:
+                        running = {
+                            "total": 0.0,
+                            "recon1": 0.0, "recon2": 0.0, "recon3": 0.0,
+                            "td_2to1": 0.0, "td_3to2": 0.0,
+                            "count": 0,
+                        }
                     last_log_time = time.time()
 
                 if config.profile and step >= config.profile_steps:

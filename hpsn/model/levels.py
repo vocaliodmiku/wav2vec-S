@@ -68,7 +68,11 @@ class HPSNLevel1(nn.Module):
     """Phonemic level. Stack of Transformer blocks with causal self-attention
     and causal cross-attention to Level 2's top-down signal μ₁. A small
     codebook-style inhibition gate runs after the blocks to model
-    phoneme-level cohort competition (categorical perception)."""
+    phoneme-level cohort competition (categorical perception).
+
+    ``use_recon_head=False`` (HPSN-v2): skip the v1 tap-reconstruction head;
+    target reconstruction lives on :class:`HPSNV2Heads` instead.
+    """
 
     def __init__(
         self,
@@ -81,6 +85,7 @@ class HPSNLevel1(nn.Module):
         causal_lookahead: int = 0,
         inhib_temperature: float = 1.0,
         inhib_top_k: int = 8,
+        use_recon_head: bool = True,
     ):
         super().__init__()
         level_dim, n_blocks = lstm_dim, n_lstm_layers
@@ -94,16 +99,16 @@ class HPSNLevel1(nn.Module):
         self.inhib_gate = LateralInhibitionGate(
             level_dim, num_codes, temperature=inhib_temperature, top_k=inhib_top_k,
         )
-        self.recon_head = nn.Linear(level_dim, hidden_dim)
+        self.recon_head = nn.Linear(level_dim, hidden_dim) if use_recon_head else None
 
     def forward(
         self, masked_input: torch.Tensor, cross_kv: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x = self.input_proj(masked_input)
         for block in self.blocks:
             x = block(x, cross_kv=cross_kv)
         x = self.inhib_gate(x)
-        recon = self.recon_head(x)
+        recon = self.recon_head(x) if self.recon_head is not None else None
         return x, recon
 
 
@@ -125,6 +130,7 @@ class HPSNLevel2(nn.Module):
         causal_lookahead: int = 0,
         inhib_temperature: float = 1.0,
         inhib_top_k: int = 64,
+        use_recon_head: bool = True,
     ):
         super().__init__()
         level_dim, n_blocks = lstm_dim, n_lstm_layers
@@ -144,17 +150,17 @@ class HPSNLevel2(nn.Module):
             nn.GELU(),
             nn.Linear(level_dim, level_dim),
         )
-        self.recon_head = nn.Linear(level_dim, hidden_dim)
+        self.recon_head = nn.Linear(level_dim, hidden_dim) if use_recon_head else None
 
     def forward(
         self, masked_input: torch.Tensor, cross_kv: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x = self.input_proj(masked_input)
         for block in self.blocks:
             x = block(x, cross_kv=cross_kv)
         x = self.inhib_gate(x)
         top_down = self.td_predictor(x)
-        recon = self.recon_head(x)
+        recon = self.recon_head(x) if self.recon_head is not None else None
         return x, top_down, recon
 
 
@@ -175,6 +181,7 @@ class HPSNLevel3(nn.Module):
         n_attn_heads: int = 8,
         dropout: float = 0.1,
         causal_lookahead: int = 0,
+        use_recon_head: bool = True,
     ):
         super().__init__()
         level_dim, n_blocks = lstm_dim, n_lstm_layers
@@ -191,14 +198,14 @@ class HPSNLevel3(nn.Module):
             nn.GELU(),
             nn.Linear(level_dim, level_dim),
         )
-        self.recon_head = nn.Linear(level_dim, hidden_dim)
+        self.recon_head = nn.Linear(level_dim, hidden_dim) if use_recon_head else None
 
     def forward(
         self, masked_input: torch.Tensor, cross_kv: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x = self.input_proj(masked_input)
         for block in self.blocks:
             x = block(x, cross_kv=cross_kv)
         top_down = self.td_predictor(x)
-        recon = self.recon_head(x)
+        recon = self.recon_head(x) if self.recon_head is not None else None
         return x, top_down, recon

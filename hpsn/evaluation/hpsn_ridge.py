@@ -302,7 +302,38 @@ def build_acoustic_feature_matrix(run, T_target, frame_rate, acoustic_feats):
 
 
 def build_condition_matrix(run, condition, h5, T_target, frame_rate):
-    """Place per-stim HPSN features (one condition) on the MEG timeline."""
+    """Place per-stim HPSN features (one condition) on the MEG timeline.
+
+    Special-case condition ``"hpsn_concat"`` synthesizes a single feature
+    matrix by concatenating ``hpsn_l1``, ``hpsn_l2``, ``hpsn_l3`` along the
+    feature axis (no re-extraction needed if the H5 already has the three
+    per-level reprs).
+    """
+    if condition == "hpsn_concat":
+        parts = ("hpsn_l1", "hpsn_l2", "hpsn_l3")
+        first_grp = h5[list(h5.keys())[0]]
+        D = sum(first_grp[p].shape[1] for p in parts)
+        X = np.zeros((T_target, D), dtype=np.float64)
+        n_placed = 0
+        for _, sev in run["sound_events"].iterrows():
+            stim_id = sev.get("stim_id", "")
+            if stim_id not in h5:
+                continue
+            grp = h5[stim_id]
+            if not all(p in grp for p in parts):
+                continue
+            feats = [grp[p][()] for p in parts]
+            T_min = min(f.shape[0] for f in feats)
+            feat = np.concatenate([f[:T_min] for f in feats], axis=1)
+            sf_ = int(sev["meg_onset"] * frame_rate)
+            ef = min(sf_ + feat.shape[0], T_target)
+            t_kept = ef - sf_
+            if t_kept <= 0:
+                continue
+            X[sf_:ef] = feat[:t_kept]
+            n_placed += 1
+        return X, n_placed
+
     D = h5[list(h5.keys())[0]][condition].shape[1]
     X = np.zeros((T_target, D), dtype=np.float64)
     n_placed = 0
